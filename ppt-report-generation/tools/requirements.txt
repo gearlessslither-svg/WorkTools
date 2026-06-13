@@ -1,0 +1,6 @@
+python-pptx
+openpyxl
+PyMuPDF
+Pillow
+requests
+pywin32
