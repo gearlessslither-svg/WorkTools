@@ -26,6 +26,7 @@ PANEL_OPEN_URL = os.environ.get("MSG_PANEL_OPEN_URL", "http://127.0.0.1:18790/")
 WIDTH = 274
 HEIGHT = 124
 POLL_SECONDS = 1.25
+PANEL_TRAFFIC_SAMPLE_SECONDS = 2.0
 SLOW_THRESHOLD_MBPS = 5.0
 
 
@@ -92,6 +93,7 @@ def fmt_mbps(value: Optional[float]) -> str:
 class TrafficSampler:
     def __init__(self) -> None:
         self.last_sample: Optional[Dict[str, Any]] = None
+        self.last_rate_mbps: Optional[float] = None
 
     def fetch(self) -> Dict[str, Any]:
         request = urllib.request.Request(PANEL_STATE_URL, headers={"User-Agent": "mullvad-speed-guard-float/1.1"})
@@ -104,13 +106,19 @@ class TrafficSampler:
         traffic = data.get("traffic") if isinstance(data.get("traffic"), dict) else {}
         state = str(connection.get("state") or "Unknown")
         now = time.monotonic()
+        sampled_at = str(traffic.get("sampled_at") or time.strftime("%Y-%m-%d %H:%M:%S"))
         download_total = int(traffic.get("download_bytes") or 0)
         upload_total = int(traffic.get("upload_bytes") or 0)
         ok = bool(traffic.get("ok")) and state.lower().startswith("connected")
+        panel_down_delta = self.optional_int(traffic.get("last_delta_download_bytes"))
+        panel_up_delta = self.optional_int(traffic.get("last_delta_upload_bytes"))
 
         down_mbps: Optional[float] = None
         up_mbps: Optional[float] = None
-        if self.last_sample:
+        if panel_down_delta is not None and panel_up_delta is not None:
+            down_mbps = (max(0, panel_down_delta) * 8) / PANEL_TRAFFIC_SAMPLE_SECONDS / 1_000_000
+            up_mbps = (max(0, panel_up_delta) * 8) / PANEL_TRAFFIC_SAMPLE_SECONDS / 1_000_000
+        elif self.last_sample and sampled_at != self.last_sample.get("sampled_at"):
             elapsed = max(0.01, now - float(self.last_sample["monotonic"]))
             down_delta = download_total - int(self.last_sample["download_total"])
             up_delta = upload_total - int(self.last_sample["upload_total"])
@@ -120,15 +128,17 @@ class TrafficSampler:
 
         self.last_sample = {
             "monotonic": now,
+            "sampled_at": sampled_at,
             "download_total": download_total,
             "upload_total": upload_total,
         }
 
         current_mbps: Optional[float]
         if down_mbps is None and up_mbps is None:
-            current_mbps = None
+            current_mbps = self.last_rate_mbps
         else:
             current_mbps = (down_mbps or 0.0) + (up_mbps or 0.0)
+            self.last_rate_mbps = current_mbps
 
         if not ok:
             status = "red"
@@ -152,8 +162,17 @@ class TrafficSampler:
             "current_mbps": current_mbps,
             "down_mbps": down_mbps,
             "up_mbps": up_mbps,
-            "sampled_at": time.strftime("%H:%M:%S"),
+            "sampled_at": sampled_at,
         }
+
+    @staticmethod
+    def optional_int(value: Any) -> Optional[int]:
+        try:
+            if value is None:
+                return None
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
 
 class FloatingTrafficWidget(tk.Tk):
@@ -222,7 +241,7 @@ class FloatingTrafficWidget(tk.Tk):
         self.state_label = tk.Label(self.top, text="PANEL OFF", font=("Helvetica", 9, "bold"), bd=0)
         self.state_label.pack(side=tk.LEFT, padx=(12, 0))
 
-        self.grip_label = tk.Label(self.top, text="...", font=("Helvetica", 10, "bold"), bd=0)
+        self.grip_label = tk.Label(self.top, text="--:--:--", font=("Helvetica", 9, "bold"), bd=0)
         self.grip_label.pack(side=tk.RIGHT, padx=(0, 10))
 
         self.body = tk.Frame(self.outer, bd=0)
@@ -381,7 +400,8 @@ class FloatingTrafficWidget(tk.Tk):
             widget.configure(bg=strip)
         self.title_label.configure(fg=text)
         self.state_label.configure(text=str(self.latest.get("state_text") or "PANEL OFF"), fg=muted)
-        self.grip_label.configure(fg=muted)
+        sampled_at = str(self.latest.get("sampled_at") or "")
+        self.grip_label.configure(text=sampled_at[-8:] if len(sampled_at) >= 8 else "--:--:--", fg=muted)
 
         for frame in (self.body, self.speed_col, self.speed_row, self.total_col):
             frame.configure(bg=bg)
