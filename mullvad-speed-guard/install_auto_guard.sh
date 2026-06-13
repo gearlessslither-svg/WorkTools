@@ -22,6 +22,36 @@ sync_traffic_totals() {
   /usr/bin/python3 "$APP_DIR/sync_traffic_totals.py" "$@"
 }
 
+run_with_timeout() {
+  local seconds="$1"
+  shift
+  /usr/bin/python3 - "$seconds" "$@" <<'PY'
+import subprocess
+import sys
+
+timeout = float(sys.argv[1])
+args = sys.argv[2:]
+try:
+    proc = subprocess.run(args, timeout=timeout)
+except subprocess.TimeoutExpired:
+    print("Timed out: " + " ".join(args), file=sys.stderr)
+    raise SystemExit(124)
+raise SystemExit(proc.returncode)
+PY
+}
+
+wait_for_auto_guard_ready() {
+  local info=""
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+    info="$(launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null || true)"
+    case "$info" in
+      *"state = running"*|*"pid = "*) return 0 ;;
+    esac
+    /bin/sleep 0.5
+  done
+  return 1
+}
+
 copy_if_newer "$RUNTIME_DIR/results/relay_inventory.sqlite3" "$APP_DIR/results/relay_inventory.sqlite3"
 copy_if_newer "$RUNTIME_DIR/results/mullvad_speed_results.jsonl" "$APP_DIR/results/mullvad_speed_results.jsonl"
 sync_traffic_totals "$RUNTIME_DIR/results/traffic_totals.json" "$APP_DIR/results/traffic_totals.json"
@@ -36,12 +66,14 @@ copy_if_newer "$APP_DIR/results/relay_inventory.sqlite3" "$RUNTIME_DIR/results/r
 copy_if_newer "$APP_DIR/results/mullvad_speed_results.jsonl" "$RUNTIME_DIR/results/mullvad_speed_results.jsonl"
 sed "s#__HOME__#$HOME#g" "$SOURCE_PLIST" > "$TARGET_PLIST"
 
-launchctl bootout "gui/$(id -u)" "$TARGET_PLIST" >/dev/null 2>&1 || true
+run_with_timeout 10 launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
+run_with_timeout 10 launchctl bootout "gui/$(id -u)" "$TARGET_PLIST" >/dev/null 2>&1 || true
 pkill -f "$RUNTIME_DIR/mullvad_speed_guard.py inventory auto-guard" >/dev/null 2>&1 || true
 rm -f "$RUNTIME_DIR/results/auto_guard.pid" "$APP_DIR/results/auto_guard.pid"
-launchctl bootstrap "gui/$(id -u)" "$TARGET_PLIST"
+run_with_timeout 10 launchctl bootstrap "gui/$(id -u)" "$TARGET_PLIST"
 launchctl enable "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
-launchctl kickstart -k "gui/$(id -u)/$LABEL"
+run_with_timeout 5 launchctl kickstart -k "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
+wait_for_auto_guard_ready
 
 echo "Auto Guard installed and started."
 echo "Status: launchctl print gui/$(id -u)/$LABEL"
