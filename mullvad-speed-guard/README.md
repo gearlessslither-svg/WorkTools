@@ -63,6 +63,15 @@ cd path/to/WorkTools/mullvad-speed-guard
 ./install_panel.sh
 ```
 
+`install_panel.sh` 会同时安装一个常驻桌面的浮动流量小窗：它只显示累计 Download / Upload 总量和当前下载速度，窗口可拖拽并记忆位置，双击可打开完整控制面板。颜色含义：红色表示断链或面板不可达，黄色表示当前下载速度低于 5 Mbps，绿色表示当前下载速度达到或超过 5 Mbps。
+
+只单独安装或移除浮窗：
+
+```bash
+./install_float_widget.sh
+./uninstall_float_widget.sh
+```
+
 查看本地控制面板：
 
 ```bash

@@ -75,6 +75,7 @@ cp "$APP_DIR/mullvad_speed_guard.py" "$RUNTIME_DIR/"
 cp "$APP_DIR/relay_inventory.py" "$RUNTIME_DIR/"
 cp "$APP_DIR/guard_panel_server.py" "$RUNTIME_DIR/"
 cp "$APP_DIR/sync_traffic_totals.py" "$RUNTIME_DIR/"
+cp "$APP_DIR/traffic_float_widget.py" "$RUNTIME_DIR/"
 cp "$APP_DIR/config.example.json" "$RUNTIME_DIR/"
 cp "$APP_DIR/README.md" "$RUNTIME_DIR/" 2>/dev/null || true
 copy_if_newer "$APP_DIR/results/relay_inventory.sqlite3" "$RUNTIME_DIR/results/relay_inventory.sqlite3"
@@ -86,6 +87,7 @@ run_with_timeout 10 launchctl bootout "gui/$(id -u)" "$TARGET_PLIST" >/dev/null 
 wait_for_panel_port_free
 run_with_timeout 10 launchctl bootstrap "gui/$(id -u)" "$TARGET_PLIST"
 wait_for_panel_ready
+"$APP_DIR/install_float_widget.sh"
 
 echo "Panel installed and started."
 echo "Status: launchctl print gui/$(id -u)/$LABEL"
