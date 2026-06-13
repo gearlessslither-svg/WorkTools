@@ -10,20 +10,23 @@ TARGET_PLIST="$TARGET_DIR/$LABEL.plist"
 
 mkdir -p "$TARGET_DIR" "$APP_DIR/results/overnight" "$RUNTIME_DIR/results/overnight"
 
+sync_traffic_totals() {
+  /usr/bin/python3 "$APP_DIR/sync_traffic_totals.py" "$@"
+}
+
 if [ ! -f "$RUNTIME_DIR/results/relay_inventory.sqlite3" ] && [ -f "$APP_DIR/results/relay_inventory.sqlite3" ]; then
   cp "$APP_DIR/results/relay_inventory.sqlite3" "$RUNTIME_DIR/results/"
 fi
 if [ ! -f "$RUNTIME_DIR/results/mullvad_speed_results.jsonl" ] && [ -f "$APP_DIR/results/mullvad_speed_results.jsonl" ]; then
   cp "$APP_DIR/results/mullvad_speed_results.jsonl" "$RUNTIME_DIR/results/"
 fi
-if [ ! -f "$RUNTIME_DIR/results/traffic_totals.json" ] && [ -f "$APP_DIR/results/traffic_totals.json" ]; then
-  cp "$APP_DIR/results/traffic_totals.json" "$RUNTIME_DIR/results/"
-fi
+sync_traffic_totals "$RUNTIME_DIR/results/traffic_totals.json" "$APP_DIR/results/traffic_totals.json"
 
 cp "$APP_DIR/mullvad_speed_guard.py" "$RUNTIME_DIR/"
 cp "$APP_DIR/relay_inventory.py" "$RUNTIME_DIR/"
 cp "$APP_DIR/guard_panel_server.py" "$RUNTIME_DIR/"
 cp "$APP_DIR/overnight_goal_runner.py" "$RUNTIME_DIR/"
+cp "$APP_DIR/sync_traffic_totals.py" "$RUNTIME_DIR/"
 cp "$APP_DIR/config.example.json" "$RUNTIME_DIR/"
 sed "s#__HOME__#$HOME#g" "$SOURCE_PLIST" > "$TARGET_PLIST"
 

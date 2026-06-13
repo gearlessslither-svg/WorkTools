@@ -21,6 +21,8 @@
 
 顶部 `VPN Traffic` 的大数字显示本工具持久维护的累计 Download / Upload 字节数；切换 relay、重建 tunnel interface、刷新网页或重启面板都不会归零。提示行会显示当前接口原始计数和估算速率。它只读取系统接口计数，不记录你访问了什么。
 
+安装或重装 LaunchAgent 时，本地源码目录和 `~/Library/Application Support/MullvadSpeedGuard` 运行目录里的累计流量文件会按更大的 download/upload 总数合并，避免因为文件时间戳或运行目录切换导致累计值回退。
+
 控制面板顶部会醒目显示 Auto Guard 状态：`RUNNING + LaunchAgent` 表示正在托管运行；`RUNNING + Unsupervised` 表示有守护进程但没有 LaunchAgent 监管，需要点 `Start Auto Guard` 迁回托管；`PAUSED` 表示已经暂停，且 VPN 不再由 Auto Guard 维持。
 
 `Fast Candidates` 会同时显示 `Fast Tested`、`True Tested`、`Risk` 和 `Known Mbps`：前者是不切 VPN 的快排探针时间，后者是真实切到该节点后下载测速的时间；`Risk` 会把节点分成 `verified`、`untested`、`previously verified`、`failed true-test`、`avoid`，避免低延迟但真测速失败的节点排在前面。`Verified Backups` 里的 `True Tested` 用来判断速度数据是否新鲜。
