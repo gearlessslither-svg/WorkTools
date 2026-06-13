@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.story.mullvad-speed-guard.overnight-goal</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>__HOME__/Library/Application Support/MullvadSpeedGuard/overnight_goal_runner.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__HOME__/Library/Application Support/MullvadSpeedGuard</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+    <key>MSG_OLLAMA_MODEL</key>
+    <string>qwen3:8b</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Application Support/MullvadSpeedGuard/results/overnight/overnight_goal.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Application Support/MullvadSpeedGuard/results/overnight/overnight_goal.log</string>
+</dict>
+</plist>

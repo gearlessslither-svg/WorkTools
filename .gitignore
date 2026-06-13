@@ -36,3 +36,13 @@ venv/
 *.bmp
 *.gif
 
+# Tool documentation assets that are part of the repository
+!mullvad-speed-guard/assets/
+!mullvad-speed-guard/assets/*.png
+
+# Local VPN guard runtime state
+mullvad-speed-guard/results/
+mullvad-speed-guard/**/*.sqlite3
+mullvad-speed-guard/**/*.log
+mullvad-speed-guard/**/*.pid
+mullvad-speed-guard/**/traffic_totals.json

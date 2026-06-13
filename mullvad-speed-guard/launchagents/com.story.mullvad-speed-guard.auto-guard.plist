@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.story.mullvad-speed-guard.auto-guard</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>__HOME__/Library/Application Support/MullvadSpeedGuard/mullvad_speed_guard.py</string>
+    <string>inventory</string>
+    <string>auto-guard</string>
+    <string>--interval</string>
+    <string>30</string>
+    <string>--health-mode</string>
+    <string>adaptive</string>
+    <string>--speed-check-every</string>
+    <string>600</string>
+    <string>--min-mbps</string>
+    <string>0.5</string>
+    <string>--preferred-mbps</string>
+    <string>8</string>
+    <string>--max-latency-ms</string>
+    <string>2500</string>
+    <string>--pool-size</string>
+    <string>5</string>
+    <string>--ready-target</string>
+    <string>3</string>
+    <string>--candidate-limit</string>
+    <string>25</string>
+    <string>--min-working-mbps</string>
+    <string>0.05</string>
+    <string>--abandon-after</string>
+    <string>3</string>
+    <string>--fast-rank-interval</string>
+    <string>3600</string>
+    <string>--failure-threshold</string>
+    <string>3</string>
+    <string>--backup-attempt-limit</string>
+    <string>3</string>
+    <string>--recovery-search-limit</string>
+    <string>50</string>
+    <string>--emergency-attempt-limit</string>
+    <string>12</string>
+    <string>--backup-retry-cooldown</string>
+    <string>900</string>
+    <string>--quick-connect-timeout</string>
+    <string>12</string>
+    <string>--disconnect-wait-timeout</string>
+    <string>5</string>
+    <string>--url-checks</string>
+    <string>https://chatgpt.com/,https://chatgpt.com/backend-api/codex/responses,https://www.youtube.com/generate_204</string>
+    <string>--url-check-timeout</string>
+    <string>10</string>
+    <string>--passive-period</string>
+    <string>900</string>
+    <string>--passive-min-down-mbps</string>
+    <string>8</string>
+    <string>--idle-refresh-after</string>
+    <string>1800</string>
+    <string>--idle-refresh-user-idle-seconds</string>
+    <string>1800</string>
+    <string>--idle-refresh-activity-threshold-bytes</string>
+    <string>262144</string>
+    <string>--idle-refresh-batch-size</string>
+    <string>1</string>
+    <string>--connecting-grace</string>
+    <string>45</string>
+    <string>--daemon-retry-cooldown</string>
+    <string>180</string>
+    <string>--url-emergency-min-failed</string>
+    <string>0</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__HOME__/Library/Application Support/MullvadSpeedGuard</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Application Support/MullvadSpeedGuard/results/auto_guard_launchagent.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Application Support/MullvadSpeedGuard/results/auto_guard_launchagent.log</string>
+</dict>
+</plist>
