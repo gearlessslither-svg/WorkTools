@@ -8,8 +8,7 @@
 
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/bin/python3</string>
-    <string>__HOME__/Library/Application Support/MullvadSpeedGuard/traffic_float_widget.py</string>
+    <string>__HOME__/Library/Application Support/MullvadSpeedGuard/traffic_float_widget</string>
   </array>
 
   <key>WorkingDirectory</key>
@@ -19,8 +18,6 @@
   <dict>
     <key>PATH</key>
     <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-    <key>PYTHONUNBUFFERED</key>
-    <string>1</string>
   </dict>
 
   <key>RunAtLoad</key>

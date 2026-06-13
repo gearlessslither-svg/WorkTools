@@ -40,12 +40,24 @@ wait_for_widget_ready() {
   return 1
 }
 
+build_native_widget() {
+  if ! command -v swiftc >/dev/null 2>&1; then
+    echo "swiftc is required to build the native floating widget." >&2
+    exit 1
+  fi
+  swiftc -O -framework Cocoa "$APP_DIR/traffic_float_widget.swift" -o "$RUNTIME_DIR/traffic_float_widget"
+  chmod +x "$RUNTIME_DIR/traffic_float_widget"
+  cp "$APP_DIR/traffic_float_widget.swift" "$RUNTIME_DIR/"
+}
+
 cp "$APP_DIR/traffic_float_widget.py" "$RUNTIME_DIR/"
+build_native_widget
 sed "s#__HOME__#$HOME#g" "$SOURCE_PLIST" > "$TARGET_PLIST"
 
 run_with_timeout 10 launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
 run_with_timeout 10 launchctl bootout "gui/$(id -u)" "$TARGET_PLIST" >/dev/null 2>&1 || true
 pkill -f "$RUNTIME_DIR/traffic_float_widget.py" >/dev/null 2>&1 || true
+pkill -f "$RUNTIME_DIR/traffic_float_widget" >/dev/null 2>&1 || true
 run_with_timeout 10 launchctl bootstrap "gui/$(id -u)" "$TARGET_PLIST"
 run_with_timeout 5 launchctl kickstart -k "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
 wait_for_widget_ready

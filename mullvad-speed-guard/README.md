@@ -63,7 +63,7 @@ cd path/to/WorkTools/mullvad-speed-guard
 ./install_panel.sh
 ```
 
-`install_panel.sh` 会同时安装一个常驻桌面的浮动流量小窗：它只显示累计 Download / Upload 总量和当前下载速度，窗口可拖拽并记忆位置，双击可打开完整控制面板。颜色含义：红色表示断链或面板不可达，黄色表示当前下载速度低于 5 Mbps，绿色表示当前下载速度达到或超过 5 Mbps。
+`install_panel.sh` 会同时安装一个原生 macOS 浮动流量小窗：它只显示累计 Download / Upload 总量和当前总速度，窗口可拖拽并记忆位置，双击可打开完整控制面板。颜色含义：红色表示断链或面板不可达，黄色表示当前总速度低于 5 Mbps，绿色表示当前总速度达到或超过 5 Mbps。浮窗由 Swift/AppKit 构建，需要本机可用的 `swiftc`，安装脚本会自动编译。
 
 只单独安装或移除浮窗：
 
