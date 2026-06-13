@@ -20,6 +20,7 @@ copy_if_newer() {
 
 copy_if_newer "$RUNTIME_DIR/results/relay_inventory.sqlite3" "$APP_DIR/results/relay_inventory.sqlite3"
 copy_if_newer "$RUNTIME_DIR/results/mullvad_speed_results.jsonl" "$APP_DIR/results/mullvad_speed_results.jsonl"
+copy_if_newer "$RUNTIME_DIR/results/traffic_totals.json" "$APP_DIR/results/traffic_totals.json"
 
 cp "$APP_DIR/mullvad_speed_guard.py" "$RUNTIME_DIR/"
 cp "$APP_DIR/relay_inventory.py" "$RUNTIME_DIR/"
@@ -28,6 +29,7 @@ cp "$APP_DIR/config.example.json" "$RUNTIME_DIR/"
 cp "$APP_DIR/README.md" "$RUNTIME_DIR/" 2>/dev/null || true
 copy_if_newer "$APP_DIR/results/relay_inventory.sqlite3" "$RUNTIME_DIR/results/relay_inventory.sqlite3"
 copy_if_newer "$APP_DIR/results/mullvad_speed_results.jsonl" "$RUNTIME_DIR/results/mullvad_speed_results.jsonl"
+copy_if_newer "$APP_DIR/results/traffic_totals.json" "$RUNTIME_DIR/results/traffic_totals.json"
 sed "s#__HOME__#$HOME#g" "$SOURCE_PLIST" > "$TARGET_PLIST"
 
 launchctl bootout "gui/$(id -u)" "$TARGET_PLIST" >/dev/null 2>&1 || true

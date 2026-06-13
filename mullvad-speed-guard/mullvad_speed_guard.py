@@ -12,10 +12,12 @@ import argparse
 import dataclasses
 import datetime as dt
 import json
+import os
 import random
 import re
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -29,6 +31,12 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = APP_DIR / "config.example.json"
 DEFAULT_RESULTS_PATH = APP_DIR / "results" / "mullvad_speed_results.jsonl"
+LAUNCH_RUNTIME_DIR = Path.home() / "Library" / "Application Support" / "MullvadSpeedGuard"
+LAUNCH_LABELS = [
+    "com.story.mullvad-speed-guard.auto-guard",
+    "com.story.mullvad-speed-guard.panel",
+    "com.story.mullvad-speed-guard.overnight-goal",
+]
 
 
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -277,6 +285,90 @@ def nudge_mullvad_app() -> Optional[str]:
     if proc.returncode == 0:
         return None
     return (proc.stderr or proc.stdout or "open Mullvad VPN failed").strip()
+
+
+def doctor_add(
+    checks: List[Dict[str, Any]],
+    name: str,
+    status: str,
+    detail: str,
+    **extra: Any,
+) -> None:
+    checks.append({"name": name, "status": status, "detail": detail, **extra})
+
+
+def doctor_launchctl_status(label: str) -> Dict[str, Any]:
+    domain = f"gui/{os.getuid()}/{label}"
+    try:
+        proc = run_cmd(["launchctl", "print", domain], timeout=5)
+    except FileNotFoundError:
+        return {"loaded": False, "running": False, "detail": "launchctl not found"}
+    except subprocess.TimeoutExpired:
+        return {"loaded": False, "running": False, "detail": "launchctl timed out"}
+
+    output = (proc.stdout or proc.stderr or "").strip()
+    if proc.returncode != 0:
+        return {
+            "loaded": False,
+            "running": False,
+            "detail": output.splitlines()[0] if output else f"launchctl exit {proc.returncode}",
+        }
+
+    pid_match = re.search(r"^\s*pid = (\d+)$", output, re.MULTILINE)
+    state_match = re.search(r"^\s*state = ([^\n]+)$", output, re.MULTILINE)
+    pid = int(pid_match.group(1)) if pid_match else None
+    state = state_match.group(1).strip() if state_match else "unknown"
+    return {
+        "loaded": True,
+        "running": bool(pid) or state == "running",
+        "pid": pid,
+        "state": state,
+        "detail": f"loaded state={state} pid={pid or '-'}",
+    }
+
+
+def doctor_panel_ping(port: int) -> Dict[str, Any]:
+    url = f"http://127.0.0.1:{port}/api/ping"
+    try:
+        with urllib.request.urlopen(url, timeout=2) as response:
+            body = response.read(512).decode("utf-8", errors="replace")
+            return {
+                "ok": 200 <= int(getattr(response, "status", 200)) < 300,
+                "detail": body.strip() or f"HTTP {getattr(response, 'status', '-')}",
+                "url": url,
+            }
+    except Exception as exc:
+        return {"ok": False, "detail": str(exc), "url": url}
+
+
+def doctor_sqlite_inventory(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {"status": "warn", "detail": f"{path} does not exist yet"}
+    try:
+        with sqlite3.connect(str(path), timeout=2) as conn:
+            conn.row_factory = sqlite3.Row
+            integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            total = conn.execute("SELECT COUNT(*) FROM relays").fetchone()[0]
+            working = conn.execute("SELECT COUNT(*) FROM relays WHERE status='working'").fetchone()[0]
+        if integrity != "ok":
+            return {"status": "fail", "detail": f"SQLite integrity_check={integrity}"}
+        return {"status": "ok", "detail": f"inventory ok total={total} working={working}"}
+    except Exception as exc:
+        return {"status": "fail", "detail": str(exc)}
+
+
+def doctor_traffic_totals(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {"status": "warn", "detail": f"{path} does not exist yet"}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"status": "fail", "detail": f"cannot parse traffic totals: {exc}"}
+    down = payload.get("total_download_bytes")
+    up = payload.get("total_upload_bytes")
+    if not isinstance(down, int) or not isinstance(up, int):
+        return {"status": "fail", "detail": "traffic totals missing integer total_download_bytes/total_upload_bytes"}
+    return {"status": "ok", "detail": f"traffic totals ok download={down} upload={up}"}
 
 
 def current_relay_hostname() -> Optional[str]:
@@ -734,6 +826,130 @@ def print_result(result: TestResult) -> None:
     )
 
 
+def command_doctor(args: argparse.Namespace) -> int:
+    checks: List[Dict[str, Any]] = []
+    report: Dict[str, Any] = {
+        "generated_at": utc_now(),
+        "app_dir": str(APP_DIR),
+        "runtime_dir": str(LAUNCH_RUNTIME_DIR),
+        "checks": checks,
+    }
+
+    try:
+        config = load_config(args.config)
+        doctor_add(checks, "config", "ok", f"loaded {args.config}")
+    except Exception as exc:
+        config = dict(DEFAULT_CONFIG)
+        doctor_add(checks, "config", "fail", f"cannot load {args.config}: {exc}")
+
+    results_path = Path(str(config.get("results_path", DEFAULT_RESULTS_PATH))).expanduser()
+    results_dir = results_path.parent
+    if results_dir.exists():
+        writable = os.access(results_dir, os.W_OK)
+        doctor_add(
+            checks,
+            "results-dir",
+            "ok" if writable else "fail",
+            f"{results_dir} exists; writable={writable}",
+        )
+    else:
+        doctor_add(checks, "results-dir", "warn", f"{results_dir} does not exist yet")
+
+    try:
+        proc = run_cmd(["mullvad", "--version"], timeout=5)
+        if proc.returncode == 0:
+            version_lines = (proc.stdout or proc.stderr).strip().splitlines()
+            version = version_lines[0] if version_lines else "mullvad --version returned no output"
+            doctor_add(checks, "mullvad-cli", "ok", version)
+            mullvad_cli_ok = True
+        else:
+            doctor_add(checks, "mullvad-cli", "fail", (proc.stderr or proc.stdout).strip() or "non-zero exit")
+            mullvad_cli_ok = False
+    except FileNotFoundError:
+        doctor_add(checks, "mullvad-cli", "fail", "mullvad CLI not found in PATH")
+        mullvad_cli_ok = False
+    except subprocess.TimeoutExpired:
+        doctor_add(checks, "mullvad-cli", "fail", "mullvad --version timed out")
+        mullvad_cli_ok = False
+
+    if mullvad_cli_ok and not args.skip_status:
+        try:
+            state, status_text = mullvad_status(timeout=5)
+            if mullvad_rpc_unavailable_text(status_text):
+                doctor_add(checks, "mullvad-status", "fail", "Mullvad management RPC unavailable", state=state)
+            elif state.lower().startswith("connected"):
+                relay = re.search(r"Relay:\s+([a-z0-9-]+)", status_text)
+                detail = f"connected relay={relay.group(1)}" if relay else "connected"
+                doctor_add(checks, "mullvad-status", "ok", detail, state=state)
+            elif state.lower().startswith("connecting"):
+                doctor_add(checks, "mullvad-status", "warn", "Mullvad is still connecting", state=state)
+            else:
+                doctor_add(checks, "mullvad-status", "fail", f"VPN state is {state}", state=state)
+        except subprocess.TimeoutExpired:
+            doctor_add(checks, "mullvad-status", "fail", "mullvad status timed out")
+        except Exception as exc:
+            doctor_add(checks, "mullvad-status", "fail", str(exc))
+
+    if not args.skip_panel:
+        ping = doctor_panel_ping(args.panel_port)
+        doctor_add(
+            checks,
+            "panel",
+            "ok" if ping["ok"] else "warn",
+            ping["detail"],
+            url=ping["url"],
+        )
+
+    if not args.skip_launchagents:
+        for label in LAUNCH_LABELS:
+            launch = doctor_launchctl_status(label)
+            status = "ok" if launch["loaded"] and launch["running"] else "warn"
+            launch_extra = {key: value for key, value in launch.items() if key != "detail"}
+            doctor_add(checks, f"launchagent:{label}", status, launch["detail"], **launch_extra)
+
+    seen_paths = set()
+    for root in [APP_DIR / "results", LAUNCH_RUNTIME_DIR / "results"]:
+        if str(root) in seen_paths:
+            continue
+        seen_paths.add(str(root))
+        db_check = doctor_sqlite_inventory(root / "relay_inventory.sqlite3")
+        doctor_add(checks, f"inventory-db:{root}", db_check["status"], db_check["detail"])
+        traffic_check = doctor_traffic_totals(root / "traffic_totals.json")
+        doctor_add(checks, f"traffic-totals:{root}", traffic_check["status"], traffic_check["detail"])
+
+    log_bytes = 0
+    if results_dir.exists():
+        log_bytes = sum(path.stat().st_size for path in results_dir.glob("*.log") if path.is_file())
+    if log_bytes > 50 * 1024 * 1024:
+        doctor_add(checks, "log-size", "warn", f"top-level logs total {log_bytes} bytes")
+    else:
+        doctor_add(checks, "log-size", "ok", f"top-level logs total {log_bytes} bytes")
+
+    counts = {
+        "ok": sum(1 for item in checks if item["status"] == "ok"),
+        "warn": sum(1 for item in checks if item["status"] == "warn"),
+        "fail": sum(1 for item in checks if item["status"] == "fail"),
+    }
+    report["summary"] = counts
+
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print(f"Mullvad Speed Guard doctor @ {report['generated_at']}")
+        print(f"App: {APP_DIR}")
+        print(f"Runtime: {LAUNCH_RUNTIME_DIR}")
+        for item in checks:
+            label = item["status"].upper()
+            print(f"[{label:4}] {item['name']}: {item['detail']}")
+        print(f"Summary: ok={counts['ok']} warn={counts['warn']} fail={counts['fail']}")
+
+    if counts["fail"]:
+        return 2
+    if counts["warn"] and args.strict:
+        return 1
+    return 0
+
+
 def restore_previous(previous_relay: Optional[str], previous_connected: bool, config: Dict[str, Any]) -> None:
     timeout = int(config.get("connect_timeout_seconds", 45))
     quick = bool(config.get("quick_connect", False))
@@ -1164,6 +1380,15 @@ def build_parser() -> argparse.ArgumentParser:
     watch_parser.add_argument("--no-update", action="store_true", help="Skip `mullvad relay update` during scans.")
     watch_parser.set_defaults(func=command_watch)
 
+    doctor_parser = subparsers.add_parser("doctor", help="Run local readiness checks without switching relays.")
+    doctor_parser.add_argument("--json", action="store_true", help="Print JSON.")
+    doctor_parser.add_argument("--strict", action="store_true", help="Return non-zero when warnings are present.")
+    doctor_parser.add_argument("--panel-port", type=int, default=18790, help="Local panel port to probe.")
+    doctor_parser.add_argument("--skip-status", action="store_true", help="Do not run `mullvad status`.")
+    doctor_parser.add_argument("--skip-panel", action="store_true", help="Do not probe the local web panel.")
+    doctor_parser.add_argument("--skip-launchagents", action="store_true", help="Do not query launchctl services.")
+    doctor_parser.set_defaults(func=command_doctor)
+
     status_parser = subparsers.add_parser("status", help="Show current Mullvad status.")
     status_parser.add_argument("--check-speed", action="store_true", help="Run one download-speed sample.")
     status_parser.add_argument("--min-mbps", type=float, help="Override slow-speed threshold.")
@@ -1339,9 +1564,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    require_mullvad()
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command != "doctor":
+        require_mullvad()
     try:
         return int(args.func(args))
     except subprocess.TimeoutExpired as exc:

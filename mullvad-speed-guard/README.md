@@ -89,6 +89,14 @@ cd path/to/WorkTools/mullvad-speed-guard
 python3 mullvad_speed_guard.py status
 ```
 
+断联或面板异常后，先跑自诊断：
+
+```bash
+python3 mullvad_speed_guard.py doctor
+```
+
+`doctor` 不会切换节点，也不会测速；它只检查 Mullvad CLI / 管理接口、LaunchAgent、控制面板端口、本地 inventory 数据库、累计流量文件和日志体积。需要给脚本或记录系统读取时可加 `--json`。
+
 列出默认候选节点：
 
 ```bash

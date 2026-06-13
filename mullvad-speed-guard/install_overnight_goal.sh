@@ -16,6 +16,9 @@ fi
 if [ ! -f "$RUNTIME_DIR/results/mullvad_speed_results.jsonl" ] && [ -f "$APP_DIR/results/mullvad_speed_results.jsonl" ]; then
   cp "$APP_DIR/results/mullvad_speed_results.jsonl" "$RUNTIME_DIR/results/"
 fi
+if [ ! -f "$RUNTIME_DIR/results/traffic_totals.json" ] && [ -f "$APP_DIR/results/traffic_totals.json" ]; then
+  cp "$APP_DIR/results/traffic_totals.json" "$RUNTIME_DIR/results/"
+fi
 
 cp "$APP_DIR/mullvad_speed_guard.py" "$RUNTIME_DIR/"
 cp "$APP_DIR/relay_inventory.py" "$RUNTIME_DIR/"
