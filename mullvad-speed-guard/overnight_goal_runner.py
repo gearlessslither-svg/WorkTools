@@ -29,6 +29,7 @@ MODEL_FALLBACKS = [
     for item in os.environ.get("MSG_OLLAMA_MODEL_FALLBACKS", "qwen3:8b,qwen2.5:7b,llama3.1:8b").split(",")
     if item.strip()
 ]
+ENABLE_OLLAMA_SETUP = os.environ.get("MSG_ENABLE_OLLAMA_SETUP", "").strip().lower() in {"1", "true", "yes", "on"}
 AUTO_GUARD_LABEL = "com.story.mullvad-speed-guard.auto-guard"
 AUTO_GUARD_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{AUTO_GUARD_LABEL}.plist"
 OLLAMA_LABEL = "com.story.ollama.serve"
@@ -306,7 +307,7 @@ def fastest_working_relay() -> Optional[Dict[str, Any]]:
 def connect_fastest() -> Optional[Dict[str, Any]]:
     relay = fastest_working_relay()
     if not relay:
-        log("No working relay is available for Ollama download.")
+        log("No working relay is available for optional setup.")
         return None
     hostname = str(relay["hostname"])
     write_auto_guard_control_lock("overnight connect fastest relay", ttl_seconds=180)
@@ -324,7 +325,7 @@ def connect_fastest() -> Optional[Dict[str, Any]]:
         )
     finally:
         clear_auto_guard_control_lock()
-    log(f"Connected fastest known relay for download: {hostname}")
+    log(f"Connected fastest known relay: {hostname}")
     return relay
 
 
@@ -417,6 +418,9 @@ def ensure_ollama_server(ollama: str) -> None:
 
 
 def setup_ollama(relay: Optional[Dict[str, Any]]) -> None:
+    if not ENABLE_OLLAMA_SETUP:
+        log("Skipping Ollama setup; set MSG_ENABLE_OLLAMA_SETUP=1 to opt in.")
+        return
     ollama = install_ollama_if_needed()
     ensure_ollama_server(ollama)
     pulled_model: Optional[str] = None

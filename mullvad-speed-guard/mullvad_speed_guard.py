@@ -36,7 +36,6 @@ LAUNCH_LABELS = [
     "com.story.mullvad-speed-guard.auto-guard",
     "com.story.mullvad-speed-guard.panel",
     "com.story.mullvad-speed-guard.float-widget",
-    "com.story.mullvad-speed-guard.overnight-goal",
 ]
 
 

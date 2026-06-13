@@ -21,8 +21,8 @@
     <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>PYTHONUNBUFFERED</key>
     <string>1</string>
-    <key>MSG_OLLAMA_MODEL</key>
-    <string>qwen3:8b</string>
+    <key>MSG_ENABLE_OLLAMA_SETUP</key>
+    <string>0</string>
   </dict>
 
   <key>RunAtLoad</key>

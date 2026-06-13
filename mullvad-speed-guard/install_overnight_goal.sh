@@ -56,3 +56,4 @@ run_with_timeout 5 launchctl kickstart -k "gui/$(id -u)/$LABEL" >/dev/null 2>&1 
 echo "Overnight goal runner installed and started."
 echo "Status: launchctl print gui/$(id -u)/$LABEL"
 echo "Log: $RUNTIME_DIR/results/overnight/overnight_goal.log"
+echo "Ollama setup is disabled by default; set MSG_ENABLE_OLLAMA_SETUP=1 only if you explicitly want it."

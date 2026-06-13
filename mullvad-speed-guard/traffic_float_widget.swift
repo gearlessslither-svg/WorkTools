@@ -5,7 +5,6 @@ import Foundation
 let widgetWidth: CGFloat = 274
 let widgetHeight: CGFloat = 124
 let pollSeconds: TimeInterval = 1.25
-let panelTrafficSampleSeconds = 2.0
 let slowThresholdMbps = 5.0
 
 let executablePath = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
@@ -53,8 +52,17 @@ struct WidgetState {
     var stateText = "PANEL OFF"
     var downloadTotal: Int?
     var uploadTotal: Int?
-    var currentMbps: Double?
+    var downloadMbps: Double?
     var sampledAt = ""
+}
+
+struct RawTrafficSample {
+    let interface: String?
+    let sampledAt: String
+    let sampledDate: Date?
+    let receivedUptime: TimeInterval
+    let rawDownload: Int
+    let rawUpload: Int
 }
 
 extension NSColor {
@@ -118,6 +126,18 @@ func formatMbps(_ value: Double?) -> String {
     return String(format: "%.2f", value)
 }
 
+func formatMBps(fromMbps value: Double?) -> String {
+    guard let value else { return "--" }
+    let megabytesPerSecond = value / 8.0
+    if megabytesPerSecond >= 100 {
+        return String(format: "%.0f", megabytesPerSecond)
+    }
+    if megabytesPerSecond >= 10 {
+        return String(format: "%.1f", megabytesPerSecond)
+    }
+    return String(format: "%.2f", megabytesPerSecond)
+}
+
 func optionalInt(_ value: Any?) -> Int? {
     if let intValue = value as? Int {
         return intValue
@@ -139,7 +159,9 @@ func optionalString(_ value: Any?) -> String? {
 }
 
 final class TrafficSampler {
-    private var lastRateMbps: Double?
+    private var lastSample: RawTrafficSample?
+    private var lastDisplayedDownloadMbps: Double?
+    private var recentDownloadRatesMbps: [Double] = []
 
     func fetch() throws -> WidgetState {
         var request = URLRequest(url: panelStateURL)
@@ -177,20 +199,40 @@ final class TrafficSampler {
         let traffic = root["traffic"] as? [String: Any] ?? [:]
         let state = optionalString(connection["state"]) ?? "Unknown"
         let sampledAt = optionalString(traffic["sampled_at"]) ?? currentTimestamp()
+        let interface = optionalString(traffic["interface"])
         let downloadTotal = optionalInt(traffic["download_bytes"]) ?? 0
         let uploadTotal = optionalInt(traffic["upload_bytes"]) ?? 0
         let ok = (traffic["ok"] as? Bool ?? false) && state.lowercased().hasPrefix("connected")
-        let downDelta = optionalInt(traffic["last_delta_download_bytes"])
-        let upDelta = optionalInt(traffic["last_delta_upload_bytes"])
+        let rawDownload = optionalInt(traffic["interface_download_bytes"])
+        let rawUpload = optionalInt(traffic["interface_upload_bytes"])
+        let resetReason = optionalString(traffic["reset_reason"])
+        let currentSample = makeSample(
+            interface: interface,
+            sampledAt: sampledAt,
+            rawDownload: rawDownload,
+            rawUpload: rawUpload
+        )
 
-        var currentMbps: Double?
-        if let downDelta, let upDelta {
-            let downMbps = Double(max(0, downDelta)) * 8.0 / panelTrafficSampleSeconds / 1_000_000.0
-            let upMbps = Double(max(0, upDelta)) * 8.0 / panelTrafficSampleSeconds / 1_000_000.0
-            currentMbps = downMbps + upMbps
-            lastRateMbps = currentMbps
-        } else {
-            currentMbps = lastRateMbps
+        var downloadMbps = lastDisplayedDownloadMbps
+        if !ok {
+            clearRateHistory()
+            downloadMbps = nil
+        } else if resetReason != nil {
+            clearRateHistory()
+            downloadMbps = nil
+        } else if let previous = lastSample, let current = currentSample {
+            downloadMbps = computeDownloadMbps(previous: previous, current: current)
+            if let computedMbps = downloadMbps {
+                rememberRate(computedMbps)
+                let smoothedMbps = median(recentDownloadRatesMbps)
+                downloadMbps = smoothedMbps
+                lastDisplayedDownloadMbps = smoothedMbps
+            } else {
+                downloadMbps = lastDisplayedDownloadMbps
+            }
+        }
+        if let currentSample {
+            lastSample = currentSample
         }
 
         var status: String
@@ -198,8 +240,8 @@ final class TrafficSampler {
         if !ok {
             status = "red"
             stateText = state.lowercased().hasPrefix("connected") ? "NO TUNNEL" : "DISCONNECTED"
-            currentMbps = nil
-        } else if currentMbps == nil || currentMbps! < slowThresholdMbps {
+            downloadMbps = nil
+        } else if downloadMbps == nil || downloadMbps! < slowThresholdMbps {
             status = "yellow"
             stateText = "SLOW"
         } else {
@@ -212,15 +254,93 @@ final class TrafficSampler {
             stateText: stateText,
             downloadTotal: downloadTotal,
             uploadTotal: uploadTotal,
-            currentMbps: currentMbps,
+            downloadMbps: downloadMbps,
             sampledAt: sampledAt
         )
+    }
+
+    private func makeSample(
+        interface: String?,
+        sampledAt: String,
+        rawDownload: Int?,
+        rawUpload: Int?
+    ) -> RawTrafficSample? {
+        guard let rawDownload, let rawUpload else {
+            return nil
+        }
+        return RawTrafficSample(
+            interface: interface,
+            sampledAt: sampledAt,
+            sampledDate: parsePanelTimestamp(sampledAt),
+            receivedUptime: ProcessInfo.processInfo.systemUptime,
+            rawDownload: rawDownload,
+            rawUpload: rawUpload
+        )
+    }
+
+    private func computeDownloadMbps(previous: RawTrafficSample, current: RawTrafficSample) -> Double? {
+        if previous.sampledAt == current.sampledAt {
+            return nil
+        }
+        if previous.interface != current.interface {
+            clearRateHistory()
+            return nil
+        }
+        if current.rawDownload < previous.rawDownload || current.rawUpload < previous.rawUpload {
+            clearRateHistory()
+            return nil
+        }
+        let elapsed = sampleElapsedSeconds(previous: previous, current: current)
+        if elapsed < 0.5 || elapsed > 30.0 {
+            return nil
+        }
+        let deltaDownload = current.rawDownload - previous.rawDownload
+        return Double(deltaDownload) * 8.0 / elapsed / 1_000_000.0
+    }
+
+    private func sampleElapsedSeconds(previous: RawTrafficSample, current: RawTrafficSample) -> TimeInterval {
+        if let previousDate = previous.sampledDate, let currentDate = current.sampledDate {
+            let elapsed = currentDate.timeIntervalSince(previousDate)
+            if elapsed > 0 {
+                return elapsed
+            }
+        }
+        return current.receivedUptime - previous.receivedUptime
+    }
+
+    private func rememberRate(_ mbps: Double) {
+        if mbps.isFinite && mbps >= 0 {
+            recentDownloadRatesMbps.append(mbps)
+            if recentDownloadRatesMbps.count > 5 {
+                recentDownloadRatesMbps.removeFirst(recentDownloadRatesMbps.count - 5)
+            }
+        }
+    }
+
+    private func clearRateHistory() {
+        recentDownloadRatesMbps.removeAll()
+        lastDisplayedDownloadMbps = nil
+    }
+
+    private func median(_ values: [Double]) -> Double? {
+        if values.isEmpty {
+            return nil
+        }
+        let sorted = values.sorted()
+        return sorted[sorted.count / 2]
     }
 
     private func currentTimestamp() -> String {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
         return formatter.string(from: Date())
+    }
+
+    private func parsePanelTimestamp(_ value: String) -> Date? {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return formatter.date(from: value)
     }
 }
 
@@ -259,9 +379,9 @@ final class WidgetView: NSView {
         drawText(timeText.isEmpty ? "--:--:--" : timeText, rect: NSRect(x: 184, y: 7, width: 76, height: 16), size: 9, weight: .bold, color: theme.muted, alignment: .right)
 
         drawText("NOW", rect: NSRect(x: 16, y: 43, width: 70, height: 13), size: 9, weight: .bold, color: theme.muted)
-        let speedText = state.status == "red" ? "--" : formatMbps(state.currentMbps)
+        let speedText = state.status == "red" ? "--" : formatMBps(fromMbps: state.downloadMbps)
         drawText(speedText, rect: NSRect(x: 16, y: 56, width: 92, height: 40), size: 30, weight: .bold, color: theme.accent)
-        drawText("Mbps", rect: NSRect(x: 105, y: 75, width: 48, height: 16), size: 10, weight: .bold, color: theme.muted)
+        drawText("MB/s", rect: NSRect(x: 105, y: 75, width: 48, height: 16), size: 10, weight: .bold, color: theme.muted)
 
         drawText("DOWN", rect: NSRect(x: 166, y: 43, width: 88, height: 13), size: 9, weight: .bold, color: theme.muted)
         drawText(formatBytes(state.downloadTotal), rect: NSRect(x: 166, y: 58, width: 94, height: 19), size: 13, weight: .bold, color: theme.text)
@@ -408,7 +528,7 @@ final class AppController: NSObject, NSApplicationDelegate {
                     var state = self.view.state
                     state.status = "red"
                     state.stateText = "PANEL OFF"
-                    state.currentMbps = nil
+                    state.downloadMbps = nil
                     state.sampledAt = String(currentClockSuffix())
                     self.view.state = state
                     self.window?.orderFrontRegardless()
