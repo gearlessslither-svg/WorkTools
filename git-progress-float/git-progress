@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""Git wrapper that reports pull/push/fetch/clone progress to a floating widget."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+
+APP_DIR = Path(__file__).resolve().parent
+RUNTIME_DIR = Path.home() / "Library" / "Application Support" / "GitProgressFloat"
+RESULTS_DIR = RUNTIME_DIR / "results"
+STATUS_PATH = RESULTS_DIR / "git_progress_status.json"
+LOG_PATH = RESULTS_DIR / "git_progress_wrapper.log"
+MONITORED = {"pull", "push", "fetch", "clone"}
+SKIP_VALUE_OPTIONS = {
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--config-env",
+    "--exec-path",
+    "--super-prefix",
+}
+
+
+def now_iso() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def log(message: str) -> None:
+    try:
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        with LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(f"[{now_iso()}] {message}\n")
+    except Exception:
+        pass
+
+
+def atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def real_git_path() -> str:
+    explicit = os.environ.get("GIT_PROGRESS_REAL_GIT")
+    if explicit and Path(explicit).exists():
+        return explicit
+    for candidate in ("/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"):
+        if Path(candidate).exists() and Path(candidate).resolve() != Path(sys.argv[0]).resolve():
+            return candidate
+    found = shutil.which("git")
+    if found and Path(found).resolve() != Path(sys.argv[0]).resolve():
+        return found
+    raise RuntimeError("real git executable not found")
+
+
+def detect_subcommand(args: List[str]) -> Tuple[Optional[str], Optional[int]]:
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            return (args[i + 1], i + 1) if i + 1 < len(args) else (None, None)
+        if arg in SKIP_VALUE_OPTIONS:
+            i += 2
+            continue
+        if any(arg.startswith(prefix + "=") for prefix in SKIP_VALUE_OPTIONS if prefix.startswith("--")):
+            i += 1
+            continue
+        if arg.startswith("-"):
+            i += 1
+            continue
+        return arg, i
+    return None, None
+
+
+def command_args_with_progress(args: List[str], subcommand: str, subcommand_index: int) -> List[str]:
+    if any(arg in {"--quiet", "-q", "--progress"} for arg in args):
+        return args
+    if subcommand not in MONITORED:
+        return args
+    updated = list(args)
+    updated.insert(subcommand_index + 1, "--progress")
+    return updated
+
+
+def repo_label(args: List[str], subcommand: str) -> str:
+    cwd = Path.cwd()
+    if subcommand == "clone":
+        non_options = [item for item in args if not item.startswith("-")]
+        if len(non_options) >= 3:
+            return Path(non_options[-1]).name or "clone"
+        if len(non_options) >= 2:
+            tail = non_options[-1].rstrip("/").split("/")[-1]
+            return tail.removesuffix(".git") or "clone"
+        return "clone"
+    return cwd.name or str(cwd)
+
+
+def initial_status(subcommand: str, args: List[str]) -> Dict[str, Any]:
+    return {
+        "schema": 1,
+        "active": True,
+        "state": "running",
+        "command": subcommand,
+        "repo": repo_label(args, subcommand),
+        "phase": "Starting",
+        "detail": f"git {subcommand}",
+        "percent": None,
+        "speed": "",
+        "updated_at": time.time(),
+        "started_at": time.time(),
+        "started_at_text": now_iso(),
+    }
+
+
+def parse_progress(raw: str) -> Optional[Dict[str, Any]]:
+    text = raw.replace("\x1b[K", "").strip()
+    if not text:
+        return None
+    if text.startswith("remote:"):
+        text = text.removeprefix("remote:").strip()
+
+    phase = None
+    percent = None
+    speed = ""
+
+    phase_match = re.search(r"^([A-Za-z][A-Za-z ]+?):\s*(.*)$", text)
+    if phase_match:
+        phase = phase_match.group(1).strip()
+
+    percent_match = re.search(r"(\d{1,3})%\s*\(", text)
+    if not percent_match:
+        percent_match = re.search(r"(\d{1,3})%", text)
+    if percent_match:
+        percent = max(0, min(100, int(percent_match.group(1))))
+
+    speed_match = re.search(r"\|\s*([^,\r\n]*?(?:[KMG]i?B|bytes)/s)", text, re.IGNORECASE)
+    if speed_match:
+        speed = " ".join(speed_match.group(1).split())
+
+    if not phase and percent is None and not speed:
+        return {"detail": text}
+
+    payload: Dict[str, Any] = {"detail": text}
+    if phase:
+        payload["phase"] = phase
+    if percent is not None:
+        payload["percent"] = percent
+    if speed:
+        payload["speed"] = speed
+    return payload
+
+
+def publish(status: Dict[str, Any], patch: Dict[str, Any]) -> None:
+    status.update(patch)
+    status["updated_at"] = time.time()
+    atomic_write_json(STATUS_PATH, status)
+
+
+def run_monitored(real_git: str, args: List[str], subcommand: str, subcommand_index: int) -> int:
+    run_args = command_args_with_progress(args, subcommand, subcommand_index)
+    status = initial_status(subcommand, run_args)
+    publish(status, {})
+
+    proc = subprocess.Popen(
+        [real_git] + run_args,
+        stdin=sys.stdin,
+        stdout=sys.stdout,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+    )
+    assert proc.stderr is not None
+
+    buffer = ""
+    last_publish = 0.0
+    while True:
+        chunk = proc.stderr.read(1)
+        if not chunk:
+            break
+        try:
+            text = chunk.decode("utf-8", errors="replace")
+        except AttributeError:
+            text = str(chunk)
+        sys.stderr.write(text)
+        sys.stderr.flush()
+        if text in {"\r", "\n"}:
+            parsed = parse_progress(buffer)
+            if parsed:
+                publish(status, parsed)
+                last_publish = time.time()
+            buffer = ""
+        else:
+            buffer += text
+            if len(buffer) > 4096:
+                buffer = buffer[-2048:]
+            if time.time() - last_publish > 0.35:
+                parsed = parse_progress(buffer)
+                if parsed:
+                    publish(status, parsed)
+                    last_publish = time.time()
+
+    if buffer:
+        parsed = parse_progress(buffer)
+        if parsed:
+            publish(status, parsed)
+
+    returncode = proc.wait()
+    final_state = "done" if returncode == 0 else "failed"
+    publish(
+        status,
+        {
+            "active": False,
+            "state": final_state,
+            "phase": "Done" if returncode == 0 else "Failed",
+            "detail": f"git {subcommand} exited with {returncode}",
+            "percent": 100 if returncode == 0 else status.get("percent"),
+            "finished_at": time.time(),
+            "returncode": returncode,
+        },
+    )
+    return returncode
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    try:
+        real_git = real_git_path()
+    except Exception as exc:
+        print(f"git-progress: {exc}", file=sys.stderr)
+        return 127
+
+    subcommand, subcommand_index = detect_subcommand(args)
+    if subcommand not in MONITORED or subcommand_index is None:
+        os.execv(real_git, [real_git] + args)
+
+    try:
+        return run_monitored(real_git, args, subcommand, subcommand_index)
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:
+        log(f"wrapper failed: {exc}")
+        print(f"git-progress: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
