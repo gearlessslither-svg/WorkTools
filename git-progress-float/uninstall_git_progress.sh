@@ -13,4 +13,4 @@ if [ -L "$WRAPPER" ] && [ "$(readlink "$WRAPPER")" = "$HOME/Library/Application 
   rm -f "$WRAPPER"
 fi
 
-echo "Git Progress Float stopped. Remove the PATH line from ~/.zshrc if you no longer want ~/.local/bin ahead of PATH."
+echo "Git Progress Float stopped. Remove the PATH line from ~/.zshrc and ~/.zprofile if you no longer want ~/.local/bin ahead of PATH."

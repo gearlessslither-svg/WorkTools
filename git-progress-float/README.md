@@ -16,6 +16,8 @@ Then open a new terminal, or run:
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
+The installer writes that PATH preference to both `~/.zshrc` and `~/.zprofile`, so interactive terminals and login shells used by command-line AI agents can both find the wrapper.
+
 ## Use
 
 Run Git normally:
@@ -29,7 +31,7 @@ git clone https://example.com/repo.git
 
 Only network/progress commands are monitored. Other commands such as `git status`, `git diff`, and `git log` are passed straight through to the real Git.
 
-Background scripts are shown when they call `git` through PATH with `~/.local/bin` first. Programs that hardcode `/usr/bin/git` bypass the wrapper and will not show widget progress.
+Background scripts and command-line AI agents are shown when they call `git` through PATH with `~/.local/bin` first. Programs that hardcode `/usr/bin/git` bypass the wrapper and will not show widget progress.
 
 ## Concurrent Git Jobs
 

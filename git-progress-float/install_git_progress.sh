@@ -26,19 +26,26 @@ chmod +x "$RUNTIME_DIR/git-progress"
 
 ln -sf "$RUNTIME_DIR/git-progress" "$WRAPPER"
 
-if [ -f "$HOME/.zshrc" ]; then
-  if ! /usr/bin/grep -Fq "$PATH_SNIPPET" "$HOME/.zshrc"; then
+ensure_path_snippet() {
+  local target="$1"
+  local label="$2"
+  if [ -f "$target" ]; then
+    if ! /usr/bin/grep -Fq "$PATH_SNIPPET" "$target"; then
+      {
+        printf '\n# %s\n' "$label"
+        printf '%s\n' "$PATH_SNIPPET"
+      } >> "$target"
+    fi
+  else
     {
-      printf '\n# Git Progress Float\n'
+      printf '# %s\n' "$label"
       printf '%s\n' "$PATH_SNIPPET"
-    } >> "$HOME/.zshrc"
+    } > "$target"
   fi
-else
-  {
-    printf '# Git Progress Float\n'
-    printf '%s\n' "$PATH_SNIPPET"
-  } > "$HOME/.zshrc"
-fi
+}
+
+ensure_path_snippet "$HOME/.zshrc" "Git Progress Float"
+ensure_path_snippet "$HOME/.zprofile" "Git Progress Float"
 
 sed "s#__HOME__#$HOME#g" "$SOURCE_PLIST" > "$TARGET_PLIST"
 launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
