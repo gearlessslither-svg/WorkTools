@@ -7,7 +7,7 @@ let widgetWidth: CGFloat = 360
 let widgetHeight: CGFloat = 174
 let maxVisibleTasks = 3
 let pollSeconds: TimeInterval = 0.25
-let doneVisibleSeconds: TimeInterval = 4.0
+let doneVisibleSeconds: TimeInterval = 12.0
 let activeVisibleSeconds: TimeInterval = 10 * 60
 
 let executablePath = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()

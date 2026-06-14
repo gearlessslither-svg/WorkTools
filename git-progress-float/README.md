@@ -41,7 +41,7 @@ Each monitored Git process writes its own status file under:
 ~/Library/Application Support/GitProgressFloat/results/tasks/
 ```
 
-The floating widget aggregates active and recently finished tasks, shows up to 3 rows at once, and keeps a count in the header when more jobs are running.
+The floating widget aggregates active and recently finished tasks, shows up to 3 rows at once, keeps a count in the header when more jobs are running, and keeps completed jobs visible briefly so fast pushes are still noticeable.
 
 ## Uninstall
 
