@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 APP_DIR = Path(__file__).resolve().parent
 RUNTIME_DIR = Path.home() / "Library" / "Application Support" / "GitProgressFloat"
 RESULTS_DIR = RUNTIME_DIR / "results"
+TASKS_DIR = RESULTS_DIR / "tasks"
 STATUS_PATH = RESULTS_DIR / "git_progress_status.json"
 LOG_PATH = RESULTS_DIR / "git_progress_wrapper.log"
 MONITORED = {"pull", "push", "fetch", "clone"}
@@ -46,8 +47,8 @@ def log(message: str) -> None:
 
 
 def atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
 
@@ -107,9 +108,42 @@ def repo_label(args: List[str], subcommand: str) -> str:
     return cwd.name or str(cwd)
 
 
+def task_id() -> str:
+    return f"{int(time.time() * 1000)}-{os.getpid()}"
+
+
+def task_path(status: Dict[str, Any]) -> Path:
+    return TASKS_DIR / f"{status['id']}.json"
+
+
+def cleanup_old_tasks() -> None:
+    try:
+        TASKS_DIR.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        for path in TASKS_DIR.glob("*.json"):
+            age = 0.0
+            try:
+                age = now - path.stat().st_mtime
+                if age > 24 * 60 * 60:
+                    path.unlink(missing_ok=True)
+                    continue
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                finished_at = payload.get("finished_at")
+                if isinstance(finished_at, (int, float)) and now - float(finished_at) > 10 * 60:
+                    path.unlink(missing_ok=True)
+            except Exception:
+                if age > 60 * 60:
+                    path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def initial_status(subcommand: str, args: List[str]) -> Dict[str, Any]:
+    now = time.time()
     return {
-        "schema": 1,
+        "schema": 2,
+        "id": task_id(),
+        "pid": os.getpid(),
         "active": True,
         "state": "running",
         "command": subcommand,
@@ -118,8 +152,8 @@ def initial_status(subcommand: str, args: List[str]) -> Dict[str, Any]:
         "detail": f"git {subcommand}",
         "percent": None,
         "speed": "",
-        "updated_at": time.time(),
-        "started_at": time.time(),
+        "updated_at": now,
+        "started_at": now,
         "started_at_text": now_iso(),
     }
 
@@ -165,11 +199,13 @@ def parse_progress(raw: str) -> Optional[Dict[str, Any]]:
 def publish(status: Dict[str, Any], patch: Dict[str, Any]) -> None:
     status.update(patch)
     status["updated_at"] = time.time()
+    atomic_write_json(task_path(status), status)
     atomic_write_json(STATUS_PATH, status)
 
 
 def run_monitored(real_git: str, args: List[str], subcommand: str, subcommand_index: int) -> int:
     run_args = command_args_with_progress(args, subcommand, subcommand_index)
+    cleanup_old_tasks()
     status = initial_status(subcommand, run_args)
     publish(status, {})
 

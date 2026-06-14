@@ -1,15 +1,19 @@
 #!/usr/bin/env swift
 import Cocoa
+import Darwin
 import Foundation
 
-let widgetWidth: CGFloat = 330
-let widgetHeight: CGFloat = 116
+let widgetWidth: CGFloat = 360
+let widgetHeight: CGFloat = 174
+let maxVisibleTasks = 3
 let pollSeconds: TimeInterval = 0.25
 let doneVisibleSeconds: TimeInterval = 4.0
+let activeVisibleSeconds: TimeInterval = 10 * 60
 
 let executablePath = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
 let appDir = executablePath.deletingLastPathComponent()
 let resultsDir = appDir.appendingPathComponent("results")
+let tasksDir = resultsDir.appendingPathComponent("tasks")
 let statusPath = resultsDir.appendingPathComponent("git_progress_status.json")
 let positionPath = resultsDir.appendingPathComponent("git_progress_widget_position.json")
 
@@ -47,17 +51,27 @@ let redTheme = Theme(
     track: NSColor(hex: "#30363d")
 )
 
-struct GitProgressState {
-    var visible = false
+struct GitProgressTask {
+    var id = ""
     var command = "git"
     var repo = ""
-    var phase = "Waiting"
+    var phase = "Working"
     var detail = ""
     var percent: Double?
     var speed = ""
-    var state = "idle"
+    var state = "running"
+    var active = false
     var updatedAt = 0.0
     var finishedAt: Double?
+    var pid: Int?
+    var visible = false
+}
+
+struct GitProgressSnapshot {
+    var visible = false
+    var tasks: [GitProgressTask] = []
+    var activeCount = 0
+    var totalVisibleCount = 0
 }
 
 extension NSColor {
@@ -83,8 +97,21 @@ func optionalDouble(_ value: Any?) -> Double? {
     return nil
 }
 
+func optionalInt(_ value: Any?) -> Int? {
+    if let intValue = value as? Int { return intValue }
+    if let doubleValue = value as? Double { return Int(doubleValue) }
+    if let stringValue = value as? String { return Int(stringValue) }
+    return nil
+}
+
+func processExists(_ pid: Int?) -> Bool {
+    guard let pid, pid > 0 else { return false }
+    let result = Darwin.kill(pid_t(pid), 0)
+    return result == 0 || errno == EPERM
+}
+
 final class ProgressView: NSView {
-    var state = GitProgressState() {
+    var snapshot = GitProgressSnapshot() {
         didSet { needsDisplay = true }
     }
     var dragOffset = NSPoint.zero
@@ -102,45 +129,59 @@ final class ProgressView: NSView {
         theme.bg.setFill()
         NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 16, yRadius: 16).fill()
         theme.strip.setFill()
-        NSBezierPath(rect: NSRect(x: 2, y: 2, width: bounds.width - 4, height: 28)).fill()
+        NSBezierPath(rect: NSRect(x: 2, y: 2, width: bounds.width - 4, height: 30)).fill()
         theme.accent.setStroke()
         let border = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 16, yRadius: 16)
         border.lineWidth = 2
         border.stroke()
 
-        theme.accent.setFill()
-        NSBezierPath(ovalIn: NSRect(x: 14, y: 11, width: 10, height: 10)).fill()
-        drawText("GIT", rect: NSRect(x: 32, y: 8, width: 34, height: 15), size: 10, weight: .bold, color: theme.text)
-        drawText(state.command.uppercased(), rect: NSRect(x: 70, y: 8, width: 78, height: 15), size: 9, weight: .bold, color: theme.muted)
-        drawText(state.repo, rect: NSRect(x: 156, y: 8, width: 154, height: 15), size: 9, weight: .bold, color: theme.muted, alignment: .right)
-
-        drawText(state.phase, rect: NSRect(x: 16, y: 42, width: 160, height: 18), size: 13, weight: .bold, color: theme.text)
-        let percentText = state.percent.map { "\(Int($0.rounded()))%" } ?? "--"
-        drawText(percentText, rect: NSRect(x: 206, y: 42, width: 44, height: 18), size: 13, weight: .bold, color: theme.accent, alignment: .right)
-        drawText(state.speed.isEmpty ? "--/s" : state.speed, rect: NSRect(x: 256, y: 42, width: 58, height: 18), size: 11, weight: .bold, color: theme.muted, alignment: .right)
-
-        drawProgressBar(theme: theme)
-        drawText(state.detail, rect: NSRect(x: 16, y: 88, width: 296, height: 16), size: 9, weight: .regular, color: theme.muted)
+        drawHeader(theme: theme)
+        for (index, task) in snapshot.tasks.prefix(maxVisibleTasks).enumerated() {
+            drawTask(task, index: index, theme: theme)
+        }
     }
 
     private func currentTheme() -> Theme {
-        if state.state == "failed" { return redTheme }
-        if state.state == "done" { return greenTheme }
+        if snapshot.tasks.contains(where: { $0.state == "failed" }) { return redTheme }
+        if !snapshot.tasks.isEmpty && snapshot.activeCount == 0 { return greenTheme }
         return blueTheme
     }
 
-    private func drawProgressBar(theme: Theme) {
-        let rect = NSRect(x: 16, y: 68, width: bounds.width - 32, height: 10)
-        theme.track.setFill()
-        NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5).fill()
+    private func drawHeader(theme: Theme) {
         theme.accent.setFill()
-        if let percent = state.percent {
-            let width = max(4, rect.width * CGFloat(max(0, min(100, percent)) / 100.0))
-            NSBezierPath(roundedRect: NSRect(x: rect.minX, y: rect.minY, width: width, height: rect.height), xRadius: 5, yRadius: 5).fill()
+        NSBezierPath(ovalIn: NSRect(x: 14, y: 12, width: 10, height: 10)).fill()
+        drawText("GIT TASKS", rect: NSRect(x: 32, y: 8, width: 82, height: 16), size: 10, weight: .bold, color: theme.text)
+
+        let activeText = snapshot.activeCount == 1 ? "1 ACTIVE" : "\(snapshot.activeCount) ACTIVE"
+        let totalText = snapshot.totalVisibleCount > maxVisibleTasks ? "\(maxVisibleTasks)/\(snapshot.totalVisibleCount) SHOWN" : activeText
+        drawText(totalText, rect: NSRect(x: 210, y: 8, width: 128, height: 16), size: 10, weight: .bold, color: theme.muted, alignment: .right)
+    }
+
+    private func drawTask(_ task: GitProgressTask, index: Int, theme: Theme) {
+        let y = CGFloat(42 + index * 42)
+        let commandRepo = "\(task.command.uppercased())  \(task.repo)"
+        drawText(commandRepo, rect: NSRect(x: 16, y: y, width: 178, height: 15), size: 11, weight: .bold, color: theme.text)
+
+        let percentText = task.percent.map { "\(Int($0.rounded()))%" } ?? "--"
+        drawText(percentText, rect: NSRect(x: 198, y: y, width: 42, height: 15), size: 11, weight: .bold, color: theme.accent, alignment: .right)
+        drawText(task.speed.isEmpty ? "--/s" : task.speed, rect: NSRect(x: 246, y: y, width: 94, height: 15), size: 10, weight: .bold, color: theme.muted, alignment: .right)
+
+        drawText(task.phase, rect: NSRect(x: 16, y: y + 17, width: 112, height: 14), size: 9, weight: .semibold, color: theme.muted)
+        drawText(task.detail, rect: NSRect(x: 132, y: y + 17, width: 208, height: 14), size: 9, weight: .regular, color: theme.muted)
+        drawProgressBar(task: task, rect: NSRect(x: 16, y: y + 32, width: bounds.width - 32, height: 6), theme: theme)
+    }
+
+    private func drawProgressBar(task: GitProgressTask, rect: NSRect, theme: Theme) {
+        theme.track.setFill()
+        NSBezierPath(roundedRect: rect, xRadius: 3, yRadius: 3).fill()
+        theme.accent.setFill()
+        if let percent = task.percent {
+            let width = max(3, rect.width * CGFloat(max(0, min(100, percent)) / 100.0))
+            NSBezierPath(roundedRect: NSRect(x: rect.minX, y: rect.minY, width: width, height: rect.height), xRadius: 3, yRadius: 3).fill()
         } else {
-            let segmentWidth = rect.width * 0.28
+            let segmentWidth = rect.width * 0.24
             let x = rect.minX + CGFloat(pulse) * (rect.width - segmentWidth)
-            NSBezierPath(roundedRect: NSRect(x: x, y: rect.minY, width: segmentWidth, height: rect.height), xRadius: 5, yRadius: 5).fill()
+            NSBezierPath(roundedRect: NSRect(x: x, y: rect.minY, width: segmentWidth, height: rect.height), xRadius: 3, yRadius: 3).fill()
         }
     }
 
@@ -210,7 +251,7 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        try? FileManager.default.createDirectory(at: resultsDir, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: tasksDir, withIntermediateDirectories: true)
         buildWindow()
         poll()
         timer = Timer.scheduledTimer(withTimeInterval: pollSeconds, repeats: true) { [weak self] _ in
@@ -258,33 +299,64 @@ final class AppController: NSObject, NSApplicationDelegate {
     }
 
     private func poll() {
-        guard let state = loadState() else {
+        guard let snapshot = loadSnapshot(), snapshot.visible else {
             window?.orderOut(nil)
             return
         }
-        view.state = state
-        if state.visible {
-            window?.orderFrontRegardless()
-        } else {
-            window?.orderOut(nil)
-        }
+        view.snapshot = snapshot
+        window?.orderFrontRegardless()
     }
 
-    private func loadState() -> GitProgressState? {
-        guard let data = try? Data(contentsOf: statusPath),
+    private func loadSnapshot() -> GitProgressSnapshot? {
+        let now = Date().timeIntervalSince1970
+        var tasks = loadTaskFiles(now: now)
+        if tasks.isEmpty, let fallback = loadTask(at: statusPath, now: now) {
+            tasks = [fallback]
+        }
+        let visibleTasks = tasks.filter { $0.visible }
+        if visibleTasks.isEmpty {
+            return nil
+        }
+        let sorted = visibleTasks.sorted { lhs, rhs in
+            if lhs.active != rhs.active { return lhs.active && !rhs.active }
+            return lhs.updatedAt > rhs.updatedAt
+        }
+        return GitProgressSnapshot(
+            visible: true,
+            tasks: Array(sorted.prefix(maxVisibleTasks)),
+            activeCount: visibleTasks.filter { $0.active }.count,
+            totalVisibleCount: visibleTasks.count
+        )
+    }
+
+    private func loadTaskFiles(now: Double) -> [GitProgressTask] {
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: tasksDir,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+        return files
+            .filter { $0.pathExtension == "json" }
+            .compactMap { loadTask(at: $0, now: now) }
+    }
+
+    private func loadTask(at url: URL, now: Double) -> GitProgressTask? {
+        guard let data = try? Data(contentsOf: url),
               let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
-        let now = Date().timeIntervalSince1970
         let active = payload["active"] as? Bool ?? false
         let stateName = optionalString(payload["state"]) ?? "idle"
         let updatedAt = optionalDouble(payload["updated_at"]) ?? 0
         let finishedAt = optionalDouble(payload["finished_at"])
+        let pid = optionalInt(payload["pid"])
         let recentlyFinished = !active && (stateName == "done" || stateName == "failed") && finishedAt.map { now - $0 < doneVisibleSeconds } == true
-        let freshActive = active && now - updatedAt < 30
+        let freshActive = active && (processExists(pid) || now - updatedAt < activeVisibleSeconds)
         let visible = freshActive || recentlyFinished
-        return GitProgressState(
-            visible: visible,
+        return GitProgressTask(
+            id: optionalString(payload["id"]) ?? url.deletingPathExtension().lastPathComponent,
             command: optionalString(payload["command"]) ?? "git",
             repo: optionalString(payload["repo"]) ?? "",
             phase: optionalString(payload["phase"]) ?? "Working",
@@ -292,8 +364,11 @@ final class AppController: NSObject, NSApplicationDelegate {
             percent: optionalDouble(payload["percent"]),
             speed: optionalString(payload["speed"]) ?? "",
             state: stateName,
+            active: active,
             updatedAt: updatedAt,
-            finishedAt: finishedAt
+            finishedAt: finishedAt,
+            pid: pid,
+            visible: visible
         )
     }
 
