@@ -42,7 +42,7 @@ class GuardGui(tk.Tk):
         self.interval = tk.StringVar(value="60")
         self.min_mbps = tk.StringVar(value="0.5")
         self.max_latency_ms = tk.StringVar(value="2500")
-        self.countries = tk.StringVar(value="hk,jp,sg,us")
+        self.countries = tk.StringVar(value="jp,sg,us")
         self.max_candidates = tk.StringVar(value="20")
         self.status_text = tk.StringVar(value="Idle")
 
@@ -155,7 +155,9 @@ class GuardGui(tk.Tk):
             "--max-latency-ms",
             self.max_latency_ms.get().strip() or "2500",
             "--countries",
-            self.countries.get().strip() or "hk,jp,sg,us",
+            self.countries.get().strip() or "jp,sg,us",
+            "--blocked-countries",
+            "hk",
             "--max-candidates",
             self.max_candidates.get().strip() or "20",
         ]
@@ -163,7 +165,9 @@ class GuardGui(tk.Tk):
     def scan_common_args(self) -> List[str]:
         return [
             "--countries",
-            self.countries.get().strip() or "hk,jp,sg,us",
+            self.countries.get().strip() or "jp,sg,us",
+            "--blocked-countries",
+            "hk",
             "--max-candidates",
             self.max_candidates.get().strip() or "20",
         ]

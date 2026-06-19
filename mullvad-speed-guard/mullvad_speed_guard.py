@@ -44,6 +44,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "candidate_cities": [],
     "candidate_hostnames": [],
     "exclude_hostnames": [],
+    "blocked_countries": ["hk"],
     "max_candidates": 0,
     "shuffle_candidates": False,
     "update_relay_list_before_scan": True,
@@ -103,9 +104,35 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "idle_refresh_user_idle_seconds": 1800,
     "idle_refresh_activity_threshold_bytes": 262144,
     "idle_refresh_batch_size": 1,
+    "nightly_full_scan_enabled": True,
+    "nightly_full_scan_cooldown_seconds": 86400,
+    "nightly_full_scan_max_seconds": 21600,
+    "nightly_full_scan_better_min_delta_mbps": 0.5,
+    "nightly_full_scan_better_min_ratio": 1.15,
     "connecting_grace_seconds": 45,
     "daemon_retry_cooldown_seconds": 180,
     "url_emergency_min_failed": 0,
+    # Global Mullvad obfuscation mode auto_guard enforces. "shadowsocks" survives
+    # China Mobile's UDP throttling (53% -> 6% loss on this line). Set to "" /
+    # "unmanaged" to let the tool leave the user's obfuscation setting untouched.
+    "anti_censorship_mode": "shadowsocks",
+    "anti_censorship_check_seconds": 600,
+    # Packet-loss probe + health gate. On CMNET loss is the dominant pain, so a
+    # relay dropping more than max_loss_pct is treated as unhealthy even if its
+    # raw download looks fine. Loss is measured only during active speed checks.
+    "loss_check_host": "1.1.1.1",
+    "loss_check_count": 10,
+    "loss_check_timeout_seconds": 5,
+    "max_loss_pct": 40.0,
+    # Daily scheduled full-node scan at a fixed local time (default 04:00). Tests
+    # every Mullvad relay, records loss/speed, and refreshes the fastest list.
+    # On by default; the float widget / panel can disable it (creates a flag file
+    # checked by scheduled_full_scan_disabled()). window_minutes is how long after
+    # the start time the daemon may still kick it off if it was busy.
+    "scheduled_full_scan_enabled": True,
+    "scheduled_full_scan_hour": 4,
+    "scheduled_full_scan_minute": 0,
+    "scheduled_full_scan_window_minutes": 180,
     "results_path": str(DEFAULT_RESULTS_PATH),
 }
 
@@ -136,6 +163,7 @@ class TestResult:
     download_mbps: Optional[float]
     score: float
     error: Optional[str] = None
+    loss_pct: Optional[float] = None
 
     def to_json(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
@@ -150,6 +178,7 @@ class HealthSample:
     passive_down_mbps: Optional[float] = None
     passive_up_mbps: Optional[float] = None
     ran_speed_test: bool = False
+    loss_pct: Optional[float] = None
 
 
 def utc_now() -> str:
@@ -204,12 +233,37 @@ def csv_list(value: Optional[str]) -> Optional[List[str]]:
     return [part.strip().lower() for part in value.split(",") if part.strip()]
 
 
+def blocked_country_codes(config: Optional[Dict[str, Any]] = None) -> set[str]:
+    source = DEFAULT_CONFIG.get("blocked_countries", [])
+    if config is not None:
+        source = config.get("blocked_countries", source)
+    return {str(item).strip().lower() for item in source if str(item).strip()}
+
+
+def hostname_country_code(hostname: Optional[str]) -> Optional[str]:
+    if not hostname:
+        return None
+    code = hostname.strip().lower().split("-", 1)[0]
+    return code or None
+
+
+def hostname_is_blocked(hostname: Optional[str], config: Optional[Dict[str, Any]] = None) -> bool:
+    code = hostname_country_code(hostname)
+    return bool(code and code in blocked_country_codes(config))
+
+
+def relay_is_blocked(relay: Relay, config: Optional[Dict[str, Any]] = None) -> bool:
+    blocked = blocked_country_codes(config)
+    return relay.country.strip().lower() in blocked or hostname_is_blocked(relay.hostname, config)
+
+
 def apply_overrides(config: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
     updated = dict(config)
     for attr, key in [
         ("countries", "candidate_countries"),
         ("cities", "candidate_cities"),
         ("hostnames", "candidate_hostnames"),
+        ("blocked_countries", "blocked_countries"),
     ]:
         value = getattr(args, attr, None)
         parsed = csv_list(value)
@@ -540,6 +594,8 @@ def filter_relays(relays: Iterable[Relay], config: Dict[str, Any]) -> List[Relay
     selected: List[Relay] = []
     for relay in relays:
         hostname = relay.hostname.lower()
+        if relay_is_blocked(relay, config):
+            continue
         if hostname in excluded:
             continue
         if hostnames:
@@ -562,9 +618,88 @@ def filter_relays(relays: Iterable[Relay], config: Dict[str, Any]) -> List[Relay
 
 
 def set_relay(hostname: str, timeout: int) -> None:
+    if hostname_is_blocked(hostname):
+        code = hostname_country_code(hostname) or "unknown"
+        raise ValueError(f"Relay {hostname} is blocked by country policy ({code}).")
     proc = run_cmd(["mullvad", "relay", "set", "location", hostname], timeout=timeout)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or proc.stdout.strip())
+
+
+# --- Anti-censorship / obfuscation -------------------------------------------
+# China Mobile (CMNET) throttles/drops UDP, which is what WireGuard uses by
+# default; on this user's line plain WireGuard saw ~53% packet loss vs ~6% with
+# Shadowsocks (TCP). The obfuscation mode is a global Mullvad daemon setting, so
+# it persists across the relay switches this tool makes. See the
+# `mullvad-speed-guard` skill for the field measurements.
+ANTI_CENSORSHIP_MODES = {"auto", "off", "wireguard-port", "udp2tcp", "shadowsocks", "quic", "lwo"}
+_ANTI_CENSORSHIP_SUBCOMMAND: Optional[str] = None
+_ANTI_CENSORSHIP_SUBCOMMAND_CHECKED = False
+
+
+def anti_censorship_subcommand(timeout: int = 5) -> Optional[str]:
+    """Resolve the obfuscation CLI subcommand once: 'anti-censorship' on
+    mullvad-cli >= 2026.x, 'obfuscation' on older builds. None if unavailable."""
+    global _ANTI_CENSORSHIP_SUBCOMMAND, _ANTI_CENSORSHIP_SUBCOMMAND_CHECKED
+    if _ANTI_CENSORSHIP_SUBCOMMAND_CHECKED:
+        return _ANTI_CENSORSHIP_SUBCOMMAND
+    _ANTI_CENSORSHIP_SUBCOMMAND_CHECKED = True
+    for name in ("anti-censorship", "obfuscation"):
+        try:
+            proc = run_cmd(["mullvad", name, "get"], timeout=timeout)
+        except Exception:
+            continue
+        if proc.returncode == 0:
+            _ANTI_CENSORSHIP_SUBCOMMAND = name
+            break
+    return _ANTI_CENSORSHIP_SUBCOMMAND
+
+
+def get_anti_censorship_mode(timeout: int = 5) -> Optional[str]:
+    sub = anti_censorship_subcommand(timeout=timeout)
+    if not sub:
+        return None
+    proc = run_cmd(["mullvad", sub, "get"], timeout=timeout)
+    if proc.returncode != 0:
+        return None
+    for line in proc.stdout.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("mode:"):
+            return stripped.split(":", 1)[1].strip().lower()
+    return None
+
+
+def set_anti_censorship_mode(mode: str, timeout: int = 10) -> None:
+    sub = anti_censorship_subcommand(timeout=timeout)
+    if not sub:
+        raise RuntimeError("mullvad CLI has no anti-censorship/obfuscation subcommand")
+    proc = run_cmd(["mullvad", sub, "set", "mode", mode], timeout=timeout)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip())
+
+
+def ensure_anti_censorship_mode(mode: Optional[str], timeout: int = 10) -> Optional[str]:
+    """Make Mullvad's global obfuscation mode match `mode`.
+
+    Returns a human-readable log line when it changed something or hit an error,
+    else None (already correct, or management disabled). A falsy mode, or one of
+    {"unmanaged", "manage-off", "none"}, means leave the user's setting alone.
+    """
+    if not mode:
+        return None
+    desired = str(mode).strip().lower()
+    if desired in {"", "unmanaged", "manage-off", "none"}:
+        return None
+    if desired not in ANTI_CENSORSHIP_MODES:
+        return f"anti-censorship mode '{desired}' is not a valid mode; leaving setting as-is"
+    current = get_anti_censorship_mode(timeout=timeout)
+    if current == desired:
+        return None
+    try:
+        set_anti_censorship_mode(desired, timeout=timeout)
+    except Exception as exc:
+        return f"failed to set anti-censorship mode -> {desired}: {exc}"
+    return f"anti-censorship mode {current or 'unknown'} -> {desired}"
 
 
 def connect(timeout: int) -> None:
@@ -647,12 +782,17 @@ def measure_latency(config: Dict[str, Any]) -> Optional[float]:
     return sum(latencies) / len(latencies)
 
 
+# Speed/latency probes must measure the raw VPN tunnel, never a system/env HTTP
+# proxy. A no-proxy opener guarantees the bytes actually traverse Mullvad.
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def download_speed_mbps(url: str, max_bytes: int, timeout: int) -> Optional[float]:
     request = urllib.request.Request(url, headers={"User-Agent": "mullvad-speed-guard/1.0"})
     start = time.monotonic()
     total = 0
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _NO_PROXY_OPENER.open(request, timeout=timeout) as response:
             while total < max_bytes:
                 chunk = response.read(min(65536, max_bytes - total))
                 if not chunk:
@@ -677,6 +817,32 @@ def measure_download(config: Dict[str, Any], bytes_key: str = "download_bytes") 
     if not speeds:
         return None
     return max(speeds)
+
+
+def measure_packet_loss(config: Dict[str, Any]) -> Optional[float]:
+    """Return packet loss as a percentage (0-100) to the configured host, or None
+    if it can't be measured. On China Mobile, loss (not raw bandwidth) is the
+    dominant cause of a tunnel feeling slow, so it is tracked as a first-class
+    relay-quality signal."""
+    host = str(config.get("loss_check_host", "1.1.1.1"))
+    count = max(3, int(config.get("loss_check_count", 10)))
+    timeout = max(2, int(config.get("loss_check_timeout_seconds", 5)))
+    try:
+        proc = run_cmd(
+            ["ping", "-c", str(count), "-i", "0.2", "-t", str(timeout), host],
+            timeout=timeout + count,
+        )
+    except Exception:
+        return None
+    text = (proc.stdout or "") + (proc.stderr or "")
+    match = re.search(r"([0-9]+(?:\.[0-9]+)?)%\s*packet loss", text)
+    if not match:
+        # No summary line (e.g. host fully unreachable within timeout) -> treat as total loss.
+        return 100.0 if proc.returncode != 0 else None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
 
 
 def url_check(url: str, timeout: int) -> bool:
@@ -751,17 +917,32 @@ def measure_url_checks(config: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def score_result(download_mbps: Optional[float], latency_ms: Optional[float], connected: bool) -> float:
+# Each 1% of packet loss costs this many score points. Sized so a heavily-lossy
+# high-bandwidth relay loses to a clean lower-bandwidth one (e.g. 14 Mbps @ 30%
+# loss scores below 6 Mbps @ 5% loss). When loss is unknown the penalty is 0, so
+# older results scored before loss tracking stay comparable.
+LOSS_PENALTY_PER_PCT = 400.0
+
+
+def score_result(
+    download_mbps: Optional[float],
+    latency_ms: Optional[float],
+    connected: bool,
+    loss_pct: Optional[float] = None,
+) -> float:
     if not connected:
         return -1_000_000.0
     speed = download_mbps or 0.0
     latency = latency_ms if latency_ms is not None else 10_000.0
-    return (speed * 1000.0) - latency
+    loss_penalty = (loss_pct or 0.0) * LOSS_PENALTY_PER_PCT
+    return (speed * 1000.0) - latency - loss_penalty
 
 
 def test_relay(relay: Relay, config: Dict[str, Any]) -> TestResult:
     timeout = int(config.get("connect_timeout_seconds", 45))
     try:
+        if relay_is_blocked(relay, config):
+            raise ValueError(f"Relay {relay.hostname} is blocked by country policy ({relay.country}).")
         quick = bool(config.get("quick_connect", False))
         quick_timeout = int(config.get("quick_connect_timeout_seconds", 12))
         disconnect_timeout = int(config.get("disconnect_wait_timeout_seconds", 5 if quick else 20))
@@ -780,6 +961,7 @@ def test_relay(relay: Relay, config: Dict[str, Any]) -> TestResult:
         connected = state.lower().startswith("connected")
         latency = measure_latency(config) if connected else None
         speed = measure_download(config) if connected else None
+        loss = measure_packet_loss(config) if connected else None
         return TestResult(
             hostname=relay.hostname,
             country=relay.country,
@@ -790,7 +972,8 @@ def test_relay(relay: Relay, config: Dict[str, Any]) -> TestResult:
             connected=connected,
             latency_ms=round(latency, 1) if latency is not None else None,
             download_mbps=round(speed, 2) if speed is not None else None,
-            score=round(score_result(speed, latency, connected), 2),
+            score=round(score_result(speed, latency, connected, loss), 2),
+            loss_pct=round(loss, 1) if loss is not None else None,
         )
     except Exception as exc:
         return TestResult(
@@ -817,11 +1000,12 @@ def write_result(path: Path, result: TestResult) -> None:
 def print_result(result: TestResult) -> None:
     speed = "n/a" if result.download_mbps is None else f"{result.download_mbps:.2f} Mbps"
     latency = "n/a" if result.latency_ms is None else f"{result.latency_ms:.1f} ms"
+    loss = "n/a" if result.loss_pct is None else f"{result.loss_pct:.0f}%"
     status = "ok" if result.connected else "failed"
     detail = f" error={result.error}" if result.error else ""
     print(
         f"{result.hostname:18} {status:6} speed={speed:>12} latency={latency:>10} "
-        f"score={result.score:>10.2f}{detail}",
+        f"loss={loss:>5} score={result.score:>10.2f}{detail}",
         flush=True,
     )
 
@@ -956,6 +1140,14 @@ def restore_previous(previous_relay: Optional[str], previous_connected: bool, co
     quick_timeout = int(config.get("quick_connect_timeout_seconds", 12))
     disconnect_timeout = int(config.get("disconnect_wait_timeout_seconds", 5 if quick else 20))
     if previous_relay:
+        if hostname_is_blocked(previous_relay, config):
+            eprint(f"Previous relay {previous_relay} is blocked; not restoring it.")
+            if previous_connected:
+                if quick:
+                    disconnect_fast(timeout=disconnect_timeout)
+                else:
+                    disconnect(timeout=20)
+            return
         eprint(f"Restoring previous relay: {previous_relay}")
         if quick and previous_connected:
             try:
@@ -1083,6 +1275,11 @@ def health_check(config: Dict[str, Any], last_speed_check_at: float) -> Tuple[He
     if not state.lower().startswith("connected"):
         return HealthSample(False, f"VPN state is {state}"), last_speed_check_at
 
+    current_relay = current_relay_hostname()
+    if hostname_is_blocked(current_relay, config):
+        code = hostname_country_code(current_relay) or "unknown"
+        return HealthSample(False, f"blocked relay country {code}: {current_relay}"), last_speed_check_at
+
     if mode == "status":
         return HealthSample(True, "connected; network probe skipped"), last_speed_check_at
 
@@ -1189,6 +1386,11 @@ def health_check(config: Dict[str, Any], last_speed_check_at: float) -> Tuple[He
             ),
             speed_checked_at,
         )
+    loss = measure_packet_loss(config)
+    loss_rounded = round(loss, 1) if loss is not None else None
+    max_loss = float(config.get("max_loss_pct") or 0)
+    loss_bad = max_loss > 0 and loss is not None and loss > max_loss
+
     min_mbps = float(config.get("min_mbps", 0.5))
     if speed < min_mbps:
         return (
@@ -1198,6 +1400,19 @@ def health_check(config: Dict[str, Any], last_speed_check_at: float) -> Tuple[He
                 latency_ms=round(latency, 1) if latency is not None else None,
                 speed_mbps=round(speed, 2),
                 ran_speed_test=True,
+                loss_pct=loss_rounded,
+            ),
+            speed_checked_at,
+        )
+    if loss_bad:
+        return (
+            HealthSample(
+                False,
+                f"packet loss {loss:.0f}% above {max_loss:.0f}% (speed {speed:.2f} Mbps)",
+                latency_ms=round(latency, 1) if latency is not None else None,
+                speed_mbps=round(speed, 2),
+                ran_speed_test=True,
+                loss_pct=loss_rounded,
             ),
             speed_checked_at,
         )
@@ -1210,16 +1425,19 @@ def health_check(config: Dict[str, Any], last_speed_check_at: float) -> Tuple[He
                 latency_ms=round(latency, 1) if latency is not None else None,
                 speed_mbps=round(speed, 2),
                 ran_speed_test=True,
+                loss_pct=loss_rounded,
             ),
             speed_checked_at,
         )
+    loss_note = f", loss {loss:.0f}%" if loss is not None else ""
     return (
         HealthSample(
             True,
-            f"speed {speed:.2f} Mbps",
+            f"speed {speed:.2f} Mbps{loss_note}",
             latency_ms=round(latency, 1) if latency is not None else None,
             speed_mbps=round(speed, 2),
             ran_speed_test=True,
+            loss_pct=loss_rounded,
         ),
         speed_checked_at,
     )
@@ -1326,9 +1544,13 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     def add_common(sub: argparse.ArgumentParser) -> None:
-        sub.add_argument("--countries", help="Comma-separated country codes, for example hk,jp,sg,us.")
-        sub.add_argument("--cities", help="Comma-separated Mullvad city codes, for example hkg,tyo,osa.")
+        sub.add_argument("--countries", help="Comma-separated country codes, for example jp,sg,us.")
+        sub.add_argument("--cities", help="Comma-separated Mullvad city codes, for example tyo,osa,sg.")
         sub.add_argument("--hostnames", help="Comma-separated relay hostnames.")
+        sub.add_argument(
+            "--blocked-countries",
+            help="Comma-separated country codes that must never be used. Default from config blocks hk.",
+        )
         sub.add_argument("--all-countries", action="store_true", help="Ignore country/city filters.")
         sub.add_argument("--max-candidates", type=int, help="Limit number of relays tested or listed.")
         sub.add_argument("--min-mbps", type=float, help="Override slow-speed threshold.")
@@ -1407,6 +1629,14 @@ def build_parser() -> argparse.ArgumentParser:
     inventory_top.add_argument("--json", action="store_true", help="Print JSON.")
     inventory_top.set_defaults(func=command_inventory)
 
+    inventory_nightly = inventory_sub.add_parser(
+        "nightly-toggle",
+        help="Turn the daily 04:00 full-node scan on/off, or show its status.",
+    )
+    inventory_nightly.add_argument("state", nargs="?", choices=["on", "off", "status"], default="status")
+    inventory_nightly.add_argument("--json", action="store_true", help="Print JSON.")
+    inventory_nightly.set_defaults(func=command_inventory)
+
     inventory_whitelist = inventory_sub.add_parser("whitelist", help="Show historically reliable relays for this time of day.")
     inventory_whitelist.add_argument("--limit", type=int, default=10)
     inventory_whitelist.add_argument("--min-mbps", type=float, default=0.05)
@@ -1437,6 +1667,13 @@ def build_parser() -> argparse.ArgumentParser:
     inventory_verify.add_argument("--fast-port", type=int, default=443)
     inventory_verify.add_argument("--connect-best", action="store_true", help="Leave VPN on the best verified relay.")
     inventory_verify.add_argument("--no-restore", action="store_true", help="Do not restore the previous relay after testing.")
+    inventory_verify.add_argument(
+        "--keep-current-if-no-better",
+        action="store_true",
+        help="Before connecting best, measure the current relay and keep it unless the best candidate is clearly faster.",
+    )
+    inventory_verify.add_argument("--better-min-delta-mbps", type=float, default=0.5)
+    inventory_verify.add_argument("--better-min-ratio", type=float, default=1.15)
     inventory_verify.add_argument("--json", action="store_true", help="Print JSON.")
     inventory_verify.set_defaults(func=command_inventory)
 
@@ -1476,6 +1713,7 @@ def build_parser() -> argparse.ArgumentParser:
     inventory_auto_guard.add_argument("--min-mbps", type=float, default=0.5)
     inventory_auto_guard.add_argument("--preferred-mbps", type=float, default=8.0)
     inventory_auto_guard.add_argument("--max-latency-ms", type=float, default=2500)
+    inventory_auto_guard.add_argument("--blocked-countries", default="hk")
     inventory_auto_guard.add_argument("--pool-size", type=int, default=5)
     inventory_auto_guard.add_argument("--ready-target", type=int, default=3)
     inventory_auto_guard.add_argument("--candidate-limit", type=int, default=25)
@@ -1535,6 +1773,11 @@ def build_parser() -> argparse.ArgumentParser:
     inventory_auto_guard.add_argument("--idle-refresh-activity-threshold-bytes", type=int, default=262144)
     inventory_auto_guard.add_argument("--idle-refresh-batch-size", type=int, default=1)
     inventory_auto_guard.add_argument("--no-idle-refresh", action="store_true")
+    inventory_auto_guard.add_argument("--nightly-full-scan-cooldown", type=int, default=86400)
+    inventory_auto_guard.add_argument("--nightly-full-scan-max-seconds", type=int, default=21600)
+    inventory_auto_guard.add_argument("--nightly-full-scan-better-min-delta-mbps", type=float, default=0.5)
+    inventory_auto_guard.add_argument("--nightly-full-scan-better-min-ratio", type=float, default=1.15)
+    inventory_auto_guard.add_argument("--no-nightly-full-scan", action="store_true")
     inventory_auto_guard.add_argument(
         "--connecting-grace",
         type=int,

@@ -49,7 +49,7 @@ LAUNCH_AUTO_GUARD_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCH_A
 PYTHON = "/usr/bin/python3"
 APP_PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 DEFAULT_PORT = 18790
-PANEL_VERSION = "2026-06-13-cumulative-traffic"
+PANEL_VERSION = "2026-06-14-manual-speed-rescue"
 LAST_INVENTORY_STATE: Dict[str, Any] = {}
 LAST_LATENCY_STATE: Dict[str, Any] = {}
 LAST_MULLVAD_STATUS_TEXT = ""
@@ -389,6 +389,10 @@ INDEX_HTML = """<!doctype html>
           <label for="countries">Countries filter</label>
           <input id="countries" value="" placeholder="empty = all countries">
         </div>
+        <div class="wide">
+          <label for="blockedCountries">Blocked countries</label>
+          <input id="blockedCountries" value="hk" placeholder="hk">
+        </div>
         <div>
           <label for="poolSize">Pool size</label>
           <input id="poolSize" type="number" min="1" step="1" value="5">
@@ -477,6 +481,22 @@ INDEX_HTML = """<!doctype html>
           <label for="idleRefreshBatch">Idle batch</label>
           <input id="idleRefreshBatch" type="number" min="1" step="1" value="1">
         </div>
+        <div>
+          <label for="nightlyFullScanCooldown">Nightly cooldown</label>
+          <input id="nightlyFullScanCooldown" type="number" min="0" step="3600" value="86400">
+        </div>
+        <div>
+          <label for="nightlyFullScanMax">Nightly max seconds</label>
+          <input id="nightlyFullScanMax" type="number" min="0" step="1800" value="21600">
+        </div>
+        <div>
+          <label for="nightlyFullScanDelta">Nightly min delta Mbps</label>
+          <input id="nightlyFullScanDelta" type="number" min="0" step="0.1" value="0.5">
+        </div>
+        <div>
+          <label for="nightlyFullScanRatio">Nightly min ratio</label>
+          <input id="nightlyFullScanRatio" type="number" min="1" step="0.01" value="1.15">
+        </div>
         <div class="wide">
           <label for="urlChecks">URL probe</label>
           <input id="urlChecks" value="https://chatgpt.com/,https://chatgpt.com/backend-api/codex/responses,https://www.youtube.com/generate_204" placeholder="comma-separated URLs">
@@ -489,6 +509,10 @@ INDEX_HTML = """<!doctype html>
           <label for="disableIdleRefresh">Disable idle refresh</label>
           <input id="disableIdleRefresh" type="checkbox">
         </div>
+        <div>
+          <label for="disableNightlyFullScan">Disable nightly full scan</label>
+          <input id="disableNightlyFullScan" type="checkbox">
+        </div>
       </div>
       <div class="actions">
         <button id="refreshBtn">Refresh</button>
@@ -497,6 +521,7 @@ INDEX_HTML = """<!doctype html>
         <button id="fastRankBtn" class="primary">Fast Rank All</button>
         <button id="stopFastRankBtn" class="danger">Stop Fast Rank</button>
         <button id="verifyPoolBtn" class="primary">True Test Pool</button>
+        <button id="speedRescueBtn" class="primary">Test + Switch</button>
         <button id="stopScanBtn" class="danger">Stop True Test</button>
         <button id="startAutoGuardBtn" class="primary">Start Auto Guard</button>
         <button id="stopAutoGuardBtn" class="danger">Stop Auto Guard</button>
@@ -570,12 +595,14 @@ INDEX_HTML = """<!doctype html>
   <script>
     const ids = [
       "healthMode", "interval", "speedEvery", "minMbps", "maxLatency", "maxCandidates", "countries",
+      "blockedCountries",
       "poolSize", "readyTarget", "candidateLimit", "fastRankEvery", "minWorkingMbps", "abandonAfter",
       "failureThreshold", "backupAttemptLimit", "quickConnectTimeout", "disconnectWaitTimeout",
       "preferredMbps", "urlCheckTimeout", "urlEmergencyMinFailed", "connectingGrace", "daemonRetryCooldown",
       "refreshPoolCooldown", "backupRetryCooldown", "passivePeriod", "passiveMinDown",
       "idleRefreshAfter", "idleRefreshUserIdle", "idleRefreshTraffic", "idleRefreshBatch",
-      "urlChecks", "refreshPoolOnFailure", "disableIdleRefresh"
+      "nightlyFullScanCooldown", "nightlyFullScanMax", "nightlyFullScanDelta", "nightlyFullScanRatio",
+      "urlChecks", "refreshPoolOnFailure", "disableIdleRefresh", "disableNightlyFullScan"
     ];
     const el = Object.fromEntries(ids.map(id => [id, document.getElementById(id)]));
     const dot = document.getElementById("dot");
@@ -610,6 +637,7 @@ INDEX_HTML = """<!doctype html>
     const fastRankBtn = document.getElementById("fastRankBtn");
     const stopFastRankBtn = document.getElementById("stopFastRankBtn");
     const verifyPoolBtn = document.getElementById("verifyPoolBtn");
+    const speedRescueBtn = document.getElementById("speedRescueBtn");
     const stopScanBtn = document.getElementById("stopScanBtn");
     const startAutoGuardBtn = document.getElementById("startAutoGuardBtn");
     const stopAutoGuardBtn = document.getElementById("stopAutoGuardBtn");
@@ -624,6 +652,7 @@ INDEX_HTML = """<!doctype html>
         preferred_mbps: el.preferredMbps.value,
         max_latency_ms: el.maxLatency.value,
         countries: el.countries.value,
+        blocked_countries: el.blockedCountries.value,
         max_candidates: el.maxCandidates.value,
         pool_size: el.poolSize.value,
         ready_target: el.readyTarget.value,
@@ -648,7 +677,12 @@ INDEX_HTML = """<!doctype html>
         idle_refresh_user_idle_seconds: el.idleRefreshUserIdle.value,
         idle_refresh_activity_threshold_bytes: el.idleRefreshTraffic.value,
         idle_refresh_batch_size: el.idleRefreshBatch.value,
+        nightly_full_scan_cooldown: el.nightlyFullScanCooldown.value,
+        nightly_full_scan_max_seconds: el.nightlyFullScanMax.value,
+        nightly_full_scan_better_min_delta_mbps: el.nightlyFullScanDelta.value,
+        nightly_full_scan_better_min_ratio: el.nightlyFullScanRatio.value,
         no_idle_refresh: el.disableIdleRefresh.checked,
+        no_nightly_full_scan: el.disableNightlyFullScan.checked,
         url_checks: el.urlChecks.value,
         refresh_pool_on_failure: el.refreshPoolOnFailure.checked
       };
@@ -788,11 +822,13 @@ INDEX_HTML = """<!doctype html>
 
     function renderInventory(inventory) {
       const counts = inventory?.counts || {};
+      const nightly = inventory?.nightly_full_scan || {};
       inventorySummary.innerHTML = [
         ["total", counts.total], ["working", counts.working], ["no speed", counts.no_speed],
         ["abandoned", counts.abandoned], ["unknown", counts.unknown],
         ["fast rank", inventory?.fast_running ? "running" : "stopped"],
         ["true test", inventory?.scan_running ? "running" : "stopped"],
+        ["nightly", nightly.due === false ? `cooldown ${Math.max(0, Math.round((nightly.cooldown_seconds - (nightly.age_seconds || 0)) / 3600))}h` : "due"],
         ["auto guard", inventory?.auto_guard_supervision?.mode || (inventory?.auto_guard_running ? "running" : "stopped")]
       ].map(([k, v]) => `<span class="pill">${esc(k)}: ${esc(v ?? 0)}</span>`).join("");
 
@@ -938,6 +974,16 @@ INDEX_HTML = """<!doctype html>
     verifyPoolBtn.addEventListener("click", () => withBusy(verifyPoolBtn, async () => {
       if (!confirm("True Test Pool will switch Mullvad through fast candidates, measure real speed, then restore the previous relay. Continue?")) return;
       await api("/api/inventory/verify-pool", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(settings())
+      });
+      await refresh();
+    }));
+
+    speedRescueBtn.addEventListener("click", () => withBusy(speedRescueBtn, async () => {
+      if (!confirm("Test + Switch will true-test fast candidates and leave Mullvad connected to the best verified relay. Continue?")) return;
+      await api("/api/inventory/speed-rescue", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(settings())
@@ -1210,6 +1256,39 @@ def stop_process(pid_path: Path, needle: str) -> bool:
             os.kill(pid, signal.SIGTERM)
         except OSError:
             pass
+    pid_path.unlink(missing_ok=True)
+    return True
+
+
+def stop_process_and_wait(pid_path: Path, needle: str, wait_seconds: float = 10.0) -> bool:
+    pid = read_pid(pid_path)
+    if not pid_running(pid, needle):
+        pid_path.unlink(missing_ok=True)
+        return False
+    assert pid is not None
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except OSError:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+    deadline = time.monotonic() + max(0.5, float(wait_seconds))
+    while time.monotonic() < deadline:
+        if not pid_running(pid, needle):
+            pid_path.unlink(missing_ok=True)
+            return True
+        time.sleep(0.2)
+
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    time.sleep(0.3)
     pid_path.unlink(missing_ok=True)
     return True
 
@@ -1631,6 +1710,8 @@ def watch_args(settings: Dict[str, Any]) -> List[str]:
         clean_number(settings.get("max_latency_ms"), "2500", allow_float=True),
         "--max-candidates",
         clean_number(settings.get("max_candidates"), "20"),
+        "--blocked-countries",
+        clean_csv(settings.get("blocked_countries"), "hk"),
     ]
     countries = clean_csv(settings.get("countries"), "")
     if countries:
@@ -1649,6 +1730,8 @@ def preview_args(settings: Dict[str, Any]) -> List[str]:
         "--no-update",
         "--max-candidates",
         clean_number(settings.get("max_candidates"), "20"),
+        "--blocked-countries",
+        clean_csv(settings.get("blocked_countries"), "hk"),
     ]
     countries = clean_csv(settings.get("countries"), "")
     if countries:
@@ -1765,6 +1848,8 @@ def inventory_state() -> Dict[str, Any]:
     }
     data = {
         "counts": source.get("counts", {}),
+        "relay_sync": source.get("relay_sync"),
+        "nightly_full_scan": source.get("nightly_full_scan"),
         "top5": compact_rows(source.get("top5"), 5),
         "fast_top5": compact_rows(source.get("fast_top5"), 10),
         "ready_top5": compact_rows(source.get("ready_top5"), 5),
@@ -1784,6 +1869,15 @@ def inventory_state() -> Dict[str, Any]:
     data["auto_guard_running"] = bool(supervision.get("running"))
     data["auto_guard_pid"] = supervision.get("launch_pid") or supervision.get("local_pid")
     data["auto_guard_control_lock"] = read_auto_guard_control_lock()
+    try:
+        scheduled_enabled = not relay_inventory.scheduled_full_scan_disabled()
+        with relay_inventory.connect_db() as _conn:
+            scheduled_last = relay_inventory.meta_value(
+                _conn, relay_inventory.META_LAST_SCHEDULED_FULL_SCAN_DATE
+            )
+        data["scheduled_full_scan"] = {"enabled": scheduled_enabled, "last_scan_date": scheduled_last}
+    except Exception:
+        data["scheduled_full_scan"] = {"enabled": True, "last_scan_date": None}
     data["fast_log_tail"] = tail(FAST_RANK_LOG_PATH, max_bytes=1200)
     data["scan_log_tail"] = tail(INVENTORY_LOG_PATH, max_bytes=1200)
     data["daemon_log_tail"] = tail(INVENTORY_DAEMON_LOG_PATH, max_bytes=1200)
@@ -1858,11 +1952,15 @@ def start_fast_rank(settings: Dict[str, Any]) -> int:
     return proc.pid
 
 
-def start_verify_pool(settings: Dict[str, Any]) -> int:
+def start_verify_pool(
+    settings: Dict[str, Any],
+    lock_reason: str = "manual true-test pool",
+    log_label: str = "true-test pool",
+) -> int:
     if scan_running():
         return read_pid(SCAN_PID_PATH) or 0
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    write_auto_guard_control_lock("manual true-test pool", ttl_seconds=1800)
+    write_auto_guard_control_lock(lock_reason, ttl_seconds=1800)
     args = [
         PYTHON,
         str(GUARD_SCRIPT),
@@ -1875,8 +1973,18 @@ def start_verify_pool(settings: Dict[str, Any]) -> int:
         args.append("--connect-best")
     if bool_setting(settings.get("no_restore"), False):
         args.append("--no-restore")
+    if bool_setting(settings.get("keep_current_if_no_better"), False):
+        args.append("--keep-current-if-no-better")
+        args.extend(
+            [
+                "--better-min-delta-mbps",
+                clean_number(settings.get("better_min_delta_mbps"), "0.5", allow_float=True),
+                "--better-min-ratio",
+                clean_number(settings.get("better_min_ratio"), "1.15", allow_float=True),
+            ]
+        )
     with INVENTORY_LOG_PATH.open("a", encoding="utf-8") as log:
-        log.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting true-test pool\n")
+        log.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting {log_label}\n")
         proc = subprocess.Popen(
             args,
             cwd=str(APP_DIR),
@@ -1887,8 +1995,77 @@ def start_verify_pool(settings: Dict[str, Any]) -> int:
             start_new_session=True,
         )
     SCAN_PID_PATH.write_text(str(proc.pid), encoding="utf-8")
-    write_auto_guard_control_lock("manual true-test pool", ttl_seconds=1800, pid=proc.pid)
+    write_auto_guard_control_lock(lock_reason, ttl_seconds=1800, pid=proc.pid)
     return proc.pid
+
+
+def start_speed_rescue(settings: Dict[str, Any]) -> int:
+    rescue_settings = dict(settings)
+    rescue_settings["connect_best"] = True
+    rescue_settings["no_restore"] = False
+    rescue_settings["keep_current_if_no_better"] = True
+    return start_verify_pool(
+        rescue_settings,
+        lock_reason="manual speed rescue",
+        log_label="speed rescue: true-test candidates and connect best",
+    )
+
+
+def connect_best_known_relay(settings: Dict[str, Any]) -> Dict[str, Any]:
+    min_working = float(clean_number(settings.get("min_working_mbps"), "0.05", allow_float=True))
+    config = {
+        "connect_timeout_seconds": 45,
+        "quick_connect": True,
+        "quick_connect_timeout_seconds": int(clean_number(settings.get("quick_connect_timeout"), "12")),
+        "disconnect_wait_timeout_seconds": int(clean_number(settings.get("disconnect_wait_timeout"), "5")),
+        "strict_hostname": True,
+        "blocked_countries": clean_csv(settings.get("blocked_countries"), "hk").split(","),
+    }
+    candidates = relay_inventory.verified_candidate_relays(limit=1, min_mbps=min_working)
+    source = "verified_candidate"
+    if not candidates:
+        candidates = relay_inventory.whitelist_relays(limit=1, min_mbps=min_working)
+        source = "whitelist"
+    if not candidates:
+        candidates = relay_inventory.top_relays(limit=1)
+        source = "top_relays"
+    if not candidates:
+        raise RuntimeError("No verified non-blocked relay is known yet.")
+
+    chosen = candidates[0]
+    hostname = str(chosen["hostname"])
+    current = relay_inventory.guard.current_relay_hostname()
+    state, status_text = relay_inventory.guard.mullvad_status()
+    if current == hostname and state.lower().startswith("connected"):
+        return {
+            "source": source,
+            "chosen": chosen,
+            "connected": {
+                "hostname": hostname,
+                "requested_hostname": hostname,
+                "actual_hostname": current,
+                "changed": False,
+                "exact_match": True,
+                "accepted_fallback": False,
+                "status": status_text,
+            },
+        }
+    return {
+        "source": source,
+        "chosen": chosen,
+        "connected": relay_inventory.connect_relay(hostname, config),
+    }
+
+
+def finish_speed_rescue(settings: Dict[str, Any]) -> Dict[str, Any]:
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    write_auto_guard_control_lock("finish speed rescue to best known", ttl_seconds=180)
+    try:
+        stopped = stop_process_and_wait(SCAN_PID_PATH, "inventory", wait_seconds=12)
+        connected = connect_best_known_relay(settings)
+        return {"stopped_scan": stopped, **connected}
+    finally:
+        clear_auto_guard_control_lock()
 
 
 def start_inventory_scan(settings: Dict[str, Any]) -> int:
@@ -2007,6 +2184,8 @@ def auto_guard_args(settings: Dict[str, Any]) -> List[str]:
         clean_number(settings.get("url_check_timeout"), "10"),
         "--url-emergency-min-failed",
         clean_number(settings.get("url_emergency_min_failed"), "0"),
+        "--blocked-countries",
+        clean_csv(settings.get("blocked_countries"), "hk"),
         "--connecting-grace",
         clean_number(settings.get("connecting_grace"), "45"),
         "--daemon-retry-cooldown",
@@ -2023,12 +2202,22 @@ def auto_guard_args(settings: Dict[str, Any]) -> List[str]:
         clean_number(settings.get("idle_refresh_activity_threshold_bytes"), "262144"),
         "--idle-refresh-batch-size",
         clean_number(settings.get("idle_refresh_batch_size"), "1"),
+        "--nightly-full-scan-cooldown",
+        clean_number(settings.get("nightly_full_scan_cooldown"), "86400"),
+        "--nightly-full-scan-max-seconds",
+        clean_number(settings.get("nightly_full_scan_max_seconds"), "21600"),
+        "--nightly-full-scan-better-min-delta-mbps",
+        clean_number(settings.get("nightly_full_scan_better_min_delta_mbps"), "0.5", allow_float=True),
+        "--nightly-full-scan-better-min-ratio",
+        clean_number(settings.get("nightly_full_scan_better_min_ratio"), "1.15", allow_float=True),
         *pool_args(settings),
     ]
     args.extend(["--recovery-search-limit", clean_number(settings.get("recovery_search_limit"), "50")])
     args.extend(["--emergency-attempt-limit", clean_number(settings.get("emergency_attempt_limit"), "12")])
     if bool_setting(settings.get("no_idle_refresh"), False):
         args.append("--no-idle-refresh")
+    if bool_setting(settings.get("no_nightly_full_scan"), False):
+        args.append("--no-nightly-full-scan")
     url_checks = clean_url_csv(settings.get("url_checks"), "")
     if url_checks:
         args.extend(["--url-checks", url_checks])
@@ -2266,6 +2455,12 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/inventory/verify-pool":
                 pid = start_verify_pool(settings)
                 json_response(self, 200, {"ok": True, "pid": pid})
+            elif path == "/api/inventory/speed-rescue":
+                pid = start_speed_rescue(settings)
+                json_response(self, 200, {"ok": True, "pid": pid})
+            elif path == "/api/inventory/finish-speed-rescue":
+                result = finish_speed_rescue(settings)
+                json_response(self, 200, {"ok": True, "result": result})
             elif path == "/api/inventory/scan":
                 pid = start_inventory_scan(settings)
                 json_response(self, 200, {"ok": True, "pid": pid})
@@ -2289,6 +2484,10 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/inventory/stop-all":
                 stopped = stop_all_switching_tasks(disconnect_vpn=True)
                 json_response(self, 200, {"ok": True, "stopped": True, **stopped})
+            elif path == "/api/inventory/nightly-fullscan":
+                enabled = bool_setting(settings.get("enabled"), True)
+                resulting = relay_inventory.set_scheduled_full_scan(enabled)
+                json_response(self, 200, {"ok": True, "enabled": resulting})
             elif path == "/api/inventory/connect":
                 hostname = str(settings.get("hostname", "")).strip().lower()
                 stop_manual_conflict_tasks()

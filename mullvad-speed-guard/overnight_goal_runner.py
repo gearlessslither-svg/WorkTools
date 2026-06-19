@@ -108,6 +108,47 @@ def query_all(sql: str, params: Iterable[Any] = ()) -> List[sqlite3.Row]:
         return conn.execute(sql, tuple(params)).fetchall()
 
 
+def load_blocked_countries() -> List[str]:
+    """Read blocked_countries from config (default ["hk"]).
+
+    Mirrors the main tool's block list so the overnight runner never selects or
+    connects to a relay in a region the rest of the system refuses (e.g. HK,
+    where ChatGPT/Codex is unavailable).
+    """
+    for cfg in (APP_DIR / "config.json", APP_DIR / "config.example.json"):
+        try:
+            data = json.loads(cfg.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        vals = data.get("blocked_countries")
+        if isinstance(vals, list):
+            return [str(v).strip().lower() for v in vals if str(v).strip()]
+    return ["hk"]
+
+
+def blocked_country_clause(column: str = "country") -> tuple[str, List[str]]:
+    codes = load_blocked_countries()
+    if not codes:
+        return "", []
+    placeholders = ",".join("?" for _ in codes)
+    return f" AND LOWER({column}) NOT IN ({placeholders})", codes
+
+
+def prune_timestamped(directory: Path, prefixes: Iterable[str], keep: int = 20) -> None:
+    """Keep only the newest `keep` files per timestamped-prefix family."""
+    for prefix in prefixes:
+        files = sorted(
+            (p for p in directory.glob(f"{prefix}*") if p.is_file()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for stale in files[keep:]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+
+
 def counts() -> Dict[str, int]:
     result = {"total": 0, "unknown": 0, "working": 0, "no_speed": 0, "abandoned": 0, "retired": 0}
     rows = query_all("SELECT status, COUNT(*) AS c FROM relays GROUP BY status")
@@ -159,19 +200,21 @@ def export_inventory(stage: str) -> Dict[str, Any]:
     write_csv(full_path, relays, list(relays[0].keys()) if relays else ["hostname"])
     write_csv(OVERNIGHT_DIR / f"full_node_inventory_{stamp}_{stage}.csv", relays, list(relays[0].keys()) if relays else ["hostname"])
 
+    wl_blocked_sql, wl_blocked_params = blocked_country_clause()
     whitelist_rows = [
         row_dict(row)
         for row in query_all(
-            """
+            f"""
             SELECT
                 hostname, country, country_name, city, city_name, provider, ownership,
                 status, last_mbps, best_mbps, last_latency_ms, score,
                 attempts, success_count, consecutive_failures,
                 last_test_at, last_success_at, fast_latency_ms, fast_probe_at
             FROM relays
-            WHERE status='working' AND COALESCE(best_mbps, last_mbps, 0) >= 0.05
+            WHERE status='working' AND COALESCE(best_mbps, last_mbps, 0) >= 0.05{wl_blocked_sql}
             ORDER BY COALESCE(best_mbps, last_mbps, 0) DESC, COALESCE(last_mbps, 0) DESC, score DESC, hostname
-            """
+            """,
+            wl_blocked_params,
         )
     ]
     whitelist_path = OVERNIGHT_DIR / "whitelist.csv"
@@ -219,6 +262,7 @@ def export_inventory(stage: str) -> Dict[str, Any]:
         json.dumps(summary, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    prune_timestamped(OVERNIGHT_DIR, ["summary_", "full_node_inventory_"], keep=20)
     copy_back_to_project()
     log(f"Exported inventory stage={stage} counts={summary['counts']} whitelist={len(whitelist_rows)}")
     return summary
@@ -292,14 +336,16 @@ def scan_unknown_relays() -> None:
 
 
 def fastest_working_relay() -> Optional[Dict[str, Any]]:
+    blocked_sql, blocked_params = blocked_country_clause()
     row = query_one(
-        """
+        f"""
         SELECT *
         FROM relays
-        WHERE status='working' AND COALESCE(best_mbps, last_mbps, 0) >= 0.05
+        WHERE status='working' AND COALESCE(best_mbps, last_mbps, 0) >= 0.05{blocked_sql}
         ORDER BY COALESCE(best_mbps, last_mbps, 0) DESC, COALESCE(last_mbps, 0) DESC, score DESC, hostname
         LIMIT 1
-        """
+        """,
+        blocked_params,
     )
     return row_dict(row) if row else None
 

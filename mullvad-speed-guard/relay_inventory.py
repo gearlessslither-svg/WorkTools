@@ -27,6 +27,43 @@ SCAN_LOG_PATH = RESULTS_DIR / "inventory_scan.log"
 AUTO_GUARD_PID_PATH = RESULTS_DIR / "auto_guard.pid"
 AUTO_GUARD_CONTROL_LOCK_PATH = RESULTS_DIR / "auto_guard_control.lock"
 
+# Daily scheduled full-node scan. The flag file's PRESENCE means "disabled"; its
+# absence (the default) means the 04:00 scan is on. Checked in both the source
+# and runtime results dirs so the panel/float widget (runtime) and CLI (source)
+# can toggle it from either side.
+RUNTIME_RESULTS_DIR = Path.home() / "Library" / "Application Support" / "MullvadSpeedGuard" / "results"
+SCHEDULED_FULL_SCAN_DISABLED_FILENAME = "nightly_fullscan.disabled"
+META_LAST_SCHEDULED_FULL_SCAN_DATE = "last_scheduled_full_scan_date"
+
+
+def _scheduled_flag_paths() -> List[Path]:
+    seen: List[Path] = []
+    for base in (RESULTS_DIR, RUNTIME_RESULTS_DIR):
+        path = base / SCHEDULED_FULL_SCAN_DISABLED_FILENAME
+        if path not in seen:
+            seen.append(path)
+    return seen
+
+
+def scheduled_full_scan_disabled() -> bool:
+    """True if the daily 04:00 full scan has been turned off via the flag file."""
+    return any(path.exists() for path in _scheduled_flag_paths())
+
+
+def set_scheduled_full_scan(enabled: bool) -> bool:
+    """Enable/disable the daily full scan by removing/creating the flag file in
+    every results dir. Returns the resulting enabled state."""
+    for path in _scheduled_flag_paths():
+        try:
+            if enabled:
+                path.unlink(missing_ok=True)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(now(), encoding="utf-8")
+        except Exception:
+            pass
+    return not scheduled_full_scan_disabled()
+
 MIN_WORKING_MBPS = 0.05
 ABANDON_AFTER = 3
 DEFAULT_POOL_SIZE = 5
@@ -35,6 +72,47 @@ DEFAULT_CANDIDATE_LIMIT = 25
 DEFAULT_FAST_WORKERS = 64
 DEFAULT_FAST_TIMEOUT = 1.2
 DEFAULT_FAST_PORT = 443
+RELAY_SYNC_TTL_SECONDS = 6 * 60 * 60
+META_LAST_RELAY_SYNC_AT = "last_relay_sync_at"
+META_LAST_NIGHTLY_FULL_SCAN_AT = "last_nightly_full_scan_at"
+META_LAST_NIGHTLY_FULL_SCAN_RESULT = "last_nightly_full_scan_result"
+DEFAULT_NIGHTLY_FULL_SCAN_COOLDOWN_SECONDS = 24 * 60 * 60
+DEFAULT_NIGHTLY_FULL_SCAN_MAX_SECONDS = 6 * 60 * 60
+DEFAULT_BETTER_MIN_DELTA_MBPS = 0.5
+DEFAULT_BETTER_MIN_RATIO = 1.15
+
+
+def blocked_country_list(config: Optional[Dict[str, Any]] = None) -> List[str]:
+    return sorted(guard.blocked_country_codes(config))
+
+
+def blocked_country_sql(column: str = "country", config: Optional[Dict[str, Any]] = None) -> tuple[str, List[Any]]:
+    countries = blocked_country_list(config)
+    if not countries:
+        return "", []
+    placeholders = ",".join("?" for _ in countries)
+    return f" AND {column} NOT IN ({placeholders})", list(countries)
+
+
+def country_is_blocked(country: Optional[str], config: Optional[Dict[str, Any]] = None) -> bool:
+    return bool(country and country.strip().lower() in guard.blocked_country_codes(config))
+
+
+def relay_hostname_blocked(
+    hostname: Optional[str],
+    db_path: Path = DB_PATH,
+    config: Optional[Dict[str, Any]] = None,
+) -> bool:
+    if guard.hostname_is_blocked(hostname, config):
+        return True
+    if not hostname:
+        return False
+    try:
+        with connect_db(db_path) as conn:
+            row = conn.execute("SELECT country FROM relays WHERE hostname=?", (hostname.strip().lower(),)).fetchone()
+    except Exception:
+        return False
+    return bool(row and country_is_blocked(row["country"], config))
 
 
 def now() -> str:
@@ -104,6 +182,9 @@ def init_db(conn: sqlite3.Connection) -> None:
             "last_health_error": "TEXT",
             "last_health_latency_ms": "REAL",
             "last_health_mbps": "REAL",
+            "last_loss_pct": "REAL",
+            "best_loss_pct": "REAL",
+            "last_health_loss_pct": "REAL",
         },
     )
     conn.execute(
@@ -124,7 +205,17 @@ def init_db(conn: sqlite3.Connection) -> None:
             latency_ms REAL,
             download_mbps REAL,
             score REAL,
-            error TEXT
+            error TEXT,
+            loss_pct REAL
+        )
+        """
+    )
+    ensure_columns(conn, "relay_results", {"loss_pct": "REAL"})
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS inventory_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
         )
         """
     )
@@ -146,7 +237,145 @@ def row_dict(row: sqlite3.Row) -> Dict[str, Any]:
     return {key: row[key] for key in row.keys()}
 
 
+def optional_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_stamp(value: Optional[str]) -> Optional[dt.datetime]:
+    if not value:
+        return None
+    try:
+        stamp = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=dt.timezone.utc)
+    return stamp.astimezone(dt.timezone.utc)
+
+
+def meta_value(conn: sqlite3.Connection, key: str) -> Optional[str]:
+    row = conn.execute("SELECT value FROM inventory_meta WHERE key=?", (key,)).fetchone()
+    return str(row["value"]) if row else None
+
+
+def set_meta_value(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO inventory_meta (key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """,
+        (key, value),
+    )
+
+
+def relay_sync_cache_state(conn: sqlite3.Connection, ttl_seconds: int = RELAY_SYNC_TTL_SECONDS) -> Dict[str, Any]:
+    last_sync_at = meta_value(conn, META_LAST_RELAY_SYNC_AT)
+    last_sync = parse_stamp(last_sync_at)
+    relay_count = int(conn.execute("SELECT COUNT(*) AS c FROM relays").fetchone()["c"])
+    age_seconds: Optional[int] = None
+    if last_sync is not None:
+        elapsed = dt.datetime.now(dt.timezone.utc) - last_sync
+        age_seconds = max(0, int(elapsed.total_seconds()))
+    fresh = relay_count > 0 and age_seconds is not None and age_seconds < max(0, int(ttl_seconds))
+    return {
+        "last_sync_at": last_sync_at,
+        "cache_age_seconds": age_seconds,
+        "cache_ttl_seconds": max(0, int(ttl_seconds)),
+        "relay_count": relay_count,
+        "fresh": fresh,
+    }
+
+
+def meta_age_state(conn: sqlite3.Connection, key: str, cooldown_seconds: int) -> Dict[str, Any]:
+    last_at = meta_value(conn, key)
+    last_stamp = parse_stamp(last_at)
+    age_seconds: Optional[int] = None
+    if last_stamp is not None:
+        elapsed = dt.datetime.now(dt.timezone.utc) - last_stamp
+        age_seconds = max(0, int(elapsed.total_seconds()))
+    cooldown = max(0, int(cooldown_seconds))
+    return {
+        "last_at": last_at,
+        "age_seconds": age_seconds,
+        "cooldown_seconds": cooldown,
+        "due": age_seconds is None or age_seconds >= cooldown,
+    }
+
+
+def nightly_full_scan_state(
+    conn: sqlite3.Connection,
+    cooldown_seconds: int = DEFAULT_NIGHTLY_FULL_SCAN_COOLDOWN_SECONDS,
+) -> Dict[str, Any]:
+    state = meta_age_state(conn, META_LAST_NIGHTLY_FULL_SCAN_AT, cooldown_seconds)
+    state["last_result"] = meta_value(conn, META_LAST_NIGHTLY_FULL_SCAN_RESULT)
+    return state
+
+
+def nightly_full_scan_due(
+    cooldown_seconds: int = DEFAULT_NIGHTLY_FULL_SCAN_COOLDOWN_SECONDS,
+    db_path: Path = DB_PATH,
+) -> Dict[str, Any]:
+    with connect_db(db_path) as conn:
+        return nightly_full_scan_state(conn, cooldown_seconds)
+
+
+def speed_beats_baseline(
+    candidate_speed: Optional[float],
+    baseline_speed: Optional[float],
+    min_working_mbps: float = MIN_WORKING_MBPS,
+    better_min_delta_mbps: float = DEFAULT_BETTER_MIN_DELTA_MBPS,
+    better_min_ratio: float = DEFAULT_BETTER_MIN_RATIO,
+) -> Dict[str, Any]:
+    candidate = optional_float(candidate_speed)
+    baseline = optional_float(baseline_speed)
+    min_working = float(min_working_mbps)
+    delta = max(0.0, float(better_min_delta_mbps))
+    ratio = max(1.0, float(better_min_ratio))
+    if candidate is None:
+        return {"ok": False, "reason": "candidate has no speed"}
+    if candidate < min_working:
+        return {
+            "ok": False,
+            "reason": "candidate below working floor",
+            "candidate_speed_mbps": round(candidate, 2),
+            "min_working_mbps": round(min_working, 2),
+        }
+    if baseline is None:
+        return {
+            "ok": True,
+            "reason": "no current baseline speed",
+            "candidate_speed_mbps": round(candidate, 2),
+        }
+    required = max(baseline + delta, baseline * ratio)
+    return {
+        "ok": candidate >= required,
+        "reason": "candidate is clearly faster" if candidate >= required else "candidate not clearly faster",
+        "candidate_speed_mbps": round(candidate, 2),
+        "baseline_speed_mbps": round(baseline, 2),
+        "required_speed_mbps": round(required, 2),
+        "better_min_delta_mbps": delta,
+        "better_min_ratio": ratio,
+    }
+
+
 def sync_relays(update: bool = False, db_path: Path = DB_PATH) -> Dict[str, Any]:
+    with connect_db(db_path) as conn:
+        cache_state = relay_sync_cache_state(conn)
+        if not update and cache_state["fresh"]:
+            return {
+                "total": cache_state["relay_count"],
+                "counts": counts(conn),
+                "cached": True,
+                "last_sync_at": cache_state["last_sync_at"],
+                "cache_age_seconds": cache_state["cache_age_seconds"],
+                "cache_ttl_seconds": cache_state["cache_ttl_seconds"],
+            }
     if update:
         guard.update_relay_list()
     relays = guard.parse_relays(guard.relay_list_text())
@@ -193,8 +422,17 @@ def sync_relays(update: bool = False, db_path: Path = DB_PATH) -> Dict[str, Any]
             "UPDATE relays SET status='retired' WHERE last_seen_at != ? AND status != 'retired'",
             (stamp,),
         )
+        set_meta_value(conn, META_LAST_RELAY_SYNC_AT, stamp)
+        cache_state = relay_sync_cache_state(conn)
         conn.commit()
-        return {"total": len(relays), "counts": counts(conn)}
+        return {
+            "total": len(relays),
+            "counts": counts(conn),
+            "cached": False,
+            "last_sync_at": stamp,
+            "cache_age_seconds": cache_state["cache_age_seconds"],
+            "cache_ttl_seconds": cache_state["cache_ttl_seconds"],
+        }
 
 
 def counts(conn: Optional[sqlite3.Connection] = None, db_path: Path = DB_PATH) -> Dict[str, int]:
@@ -214,12 +452,13 @@ def counts(conn: Optional[sqlite3.Connection] = None, db_path: Path = DB_PATH) -
 
 
 def top_relays(limit: int = 5, db_path: Path = DB_PATH) -> List[Dict[str, Any]]:
+    blocked_sql, blocked_params = blocked_country_sql()
     with connect_db(db_path) as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT *
             FROM relays
-            WHERE status='working' AND last_mbps IS NOT NULL
+            WHERE status='working' AND last_mbps IS NOT NULL{blocked_sql}
             ORDER BY
                 CASE
                     WHEN last_health_ok=1 AND last_health_latency_ms IS NOT NULL AND last_health_mbps IS NOT NULL THEN 0
@@ -231,15 +470,16 @@ def top_relays(limit: int = 5, db_path: Path = DB_PATH) -> List[Dict[str, Any]]:
                 best_mbps DESC
             LIMIT ?
             """,
-            (limit,),
+            (*blocked_params, limit),
         ).fetchall()
         return [row_dict(row) for row in rows]
 
 
 def fast_top_relays(limit: int = 5, db_path: Path = DB_PATH) -> List[Dict[str, Any]]:
+    blocked_sql, blocked_params = blocked_country_sql()
     with connect_db(db_path) as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT *,
                 CASE
                     WHEN status='working' AND success_count > 0 THEN 'verified'
@@ -260,7 +500,7 @@ def fast_top_relays(limit: int = 5, db_path: Path = DB_PATH) -> List[Dict[str, A
                     ELSE 2
                 END AS candidate_rank
             FROM relays
-            WHERE fast_probe_at IS NOT NULL
+            WHERE fast_probe_at IS NOT NULL{blocked_sql}
             ORDER BY
                 fast_reachable DESC,
                 candidate_rank ASC,
@@ -276,7 +516,7 @@ def fast_top_relays(limit: int = 5, db_path: Path = DB_PATH) -> List[Dict[str, A
                 hostname
             LIMIT ?
             """,
-            (limit,),
+            (*blocked_params, limit),
         ).fetchall()
         return [row_dict(row) for row in rows]
 
@@ -294,6 +534,9 @@ def verified_candidate_relays(
         placeholders = ",".join("?" for _ in names)
         where += f" AND hostname IN ({placeholders})"
         params.extend(names)
+    blocked_sql, blocked_params = blocked_country_sql()
+    where += blocked_sql
+    params.extend(blocked_params)
     sql = f"""
         SELECT *
         FROM relays
@@ -341,10 +584,11 @@ def whitelist_relays(
     min_mbps = float(min_mbps)
     preferred_mbps = float(preferred_mbps)
     history_limit = max(50, int(history_limit))
+    blocked_sql, blocked_params = blocked_country_sql("relays.country")
 
     with connect_db(db_path) as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT
                 r.hostname, r.observed_at, r.connected, r.latency_ms, r.download_mbps, r.score AS result_score,
                 relays.country, relays.country_name, relays.city, relays.city_name, relays.provider,
@@ -354,11 +598,11 @@ def whitelist_relays(
                 relays.last_health_latency_ms, relays.last_health_mbps
             FROM relay_results r
             JOIN relays ON relays.hostname = r.hostname
-            WHERE relays.status != 'retired'
+            WHERE relays.status != 'retired'{blocked_sql}
             ORDER BY r.id DESC
             LIMIT ?
             """,
-            (history_limit,),
+            (*blocked_params, history_limit),
         ).fetchall()
 
     stats: Dict[str, Dict[str, Any]] = {}
@@ -480,16 +724,25 @@ def whitelist_relays(
 
 
 def recent_results(limit: int = 20, db_path: Path = DB_PATH) -> List[Dict[str, Any]]:
+    blocked = blocked_country_list()
+    where = ""
+    params: List[Any] = []
+    if blocked:
+        placeholders = ",".join("?" for _ in blocked)
+        where = f"WHERE (relays.country IS NULL OR relays.country NOT IN ({placeholders}))"
+        params.extend(blocked)
+    params.append(limit)
     with connect_db(db_path) as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT r.*, relays.country, relays.city, relays.provider
             FROM relay_results r
             LEFT JOIN relays ON relays.hostname = r.hostname
+            {where}
             ORDER BY r.id DESC
             LIMIT ?
             """,
-            (limit,),
+            params,
         ).fetchall()
         return [row_dict(row) for row in rows]
 
@@ -498,6 +751,8 @@ def summary(db_path: Path = DB_PATH) -> Dict[str, Any]:
     with connect_db(db_path) as conn:
         return {
             "counts": counts(conn),
+            "relay_sync": relay_sync_cache_state(conn),
+            "nightly_full_scan": nightly_full_scan_state(conn),
             "top5": top_relays(5, db_path),
             "fast_top5": fast_top_relays(10, db_path),
             "ready_top5": verified_candidate_relays(5, MIN_WORKING_MBPS, db_path=db_path),
@@ -519,6 +774,9 @@ def record_result(
         attempts = int(row["attempts"]) if row else 0
         best_mbps = row["best_mbps"] if row else None
 
+        loss_pct = getattr(result, "loss_pct", None)
+        best_loss = row["best_loss_pct"] if row and "best_loss_pct" in row.keys() else None
+
         has_speed = bool(result.connected and result.download_mbps is not None and result.download_mbps >= min_working_mbps)
         if has_speed:
             status = "working"
@@ -526,6 +784,9 @@ def record_result(
             success_count += 1
             best_mbps = max(float(best_mbps or 0), float(result.download_mbps or 0))
             last_success_at = result.observed_at
+            if loss_pct is not None:
+                # "best" loss is the lowest (cleanest) observed on a working test.
+                best_loss = loss_pct if best_loss is None else min(float(best_loss), float(loss_pct))
         else:
             consecutive += 1
             last_success_at = row["last_success_at"] if row else None
@@ -545,7 +806,9 @@ def record_result(
                 success_count=?,
                 consecutive_failures=?,
                 status=?,
-                last_error=?
+                last_error=?,
+                last_loss_pct=?,
+                best_loss_pct=?
             WHERE hostname=?
             """,
             (
@@ -560,15 +823,17 @@ def record_result(
                 consecutive,
                 status,
                 result.error,
+                loss_pct,
+                best_loss,
                 result.hostname,
             ),
         )
         conn.execute(
             """
             INSERT INTO relay_results (
-                hostname, observed_at, connected, latency_ms, download_mbps, score, error
+                hostname, observed_at, connected, latency_ms, download_mbps, score, error, loss_pct
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 result.hostname,
@@ -578,6 +843,7 @@ def record_result(
                 result.download_mbps,
                 result.score,
                 result.error,
+                loss_pct,
             ),
         )
         conn.commit()
@@ -593,6 +859,7 @@ def record_health_check(
         return
     try:
         with connect_db(db_path) as conn:
+            loss_pct = getattr(sample, "loss_pct", None)
             conn.execute(
                 """
                 UPDATE relays
@@ -601,7 +868,9 @@ def record_health_check(
                     last_health_ok=?,
                     last_health_error=?,
                     last_health_latency_ms=?,
-                    last_health_mbps=?
+                    last_health_mbps=?,
+                    last_health_loss_pct=?,
+                    last_loss_pct=COALESCE(?, last_loss_pct)
                 WHERE hostname=?
                 """,
                 (
@@ -610,6 +879,8 @@ def record_health_check(
                     None if sample.ok else sample.reason,
                     sample.latency_ms,
                     sample.speed_mbps,
+                    loss_pct,
+                    loss_pct,
                     hostname.strip().lower(),
                 ),
             )
@@ -652,12 +923,26 @@ def full_health_check(config: Dict[str, Any]) -> guard.HealthSample:
             speed_mbps=round(speed, 2),
             ran_speed_test=True,
         )
+    loss = guard.measure_packet_loss(config)
+    loss_rounded = round(loss, 1) if loss is not None else None
+    max_loss = float(config.get("max_loss_pct") or 0)
+    if max_loss > 0 and loss is not None and loss > max_loss:
+        return guard.HealthSample(
+            False,
+            f"packet loss {loss:.0f}% above {max_loss:.0f}% (speed {speed:.2f} Mbps)",
+            latency_ms=rounded_latency,
+            speed_mbps=round(speed, 2),
+            ran_speed_test=True,
+            loss_pct=loss_rounded,
+        )
+    loss_note = f" loss {loss:.0f}%" if loss is not None else ""
     return guard.HealthSample(
         True,
-        f"full health speed {speed:.2f} Mbps latency {latency:.1f} ms",
+        f"full health speed {speed:.2f} Mbps latency {latency:.1f} ms{loss_note}",
         latency_ms=rounded_latency,
         speed_mbps=round(speed, 2),
         ran_speed_test=True,
+        loss_pct=loss_rounded,
     )
 
 
@@ -692,14 +977,16 @@ def fast_rank_all(
     db_path: Path = DB_PATH,
 ) -> Dict[str, Any]:
     sync_relays(update=False, db_path=db_path)
+    blocked_sql, blocked_params = blocked_country_sql()
     with connect_db(db_path) as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT hostname, ipv4, country, city, provider
             FROM relays
-            WHERE status != 'retired' AND ipv4 IS NOT NULL
+            WHERE status != 'retired' AND ipv4 IS NOT NULL{blocked_sql}
             ORDER BY hostname
-            """
+            """,
+            blocked_params,
         ).fetchall()
 
     if limit > 0:
@@ -787,6 +1074,10 @@ def relays_for_scope(
     else:
         raise ValueError(f"Unknown inventory scope: {scope}")
 
+    blocked_sql, blocked_params = blocked_country_sql()
+    where += blocked_sql
+    params.extend(blocked_params)
+
     if scope in {"active", "top"}:
         order = "score DESC, last_mbps DESC, hostname"
     elif scope == "fast":
@@ -814,6 +1105,12 @@ def relays_by_hostnames(hostnames: Iterable[str], db_path: Path = DB_PATH) -> Li
             f"SELECT * FROM relays WHERE hostname IN ({placeholders}) ORDER BY hostname",
             names,
         ).fetchall()
+        blocked = [str(row["hostname"]) for row in rows if country_is_blocked(row["country"])]
+        if blocked:
+            raise ValueError(
+                "Blocked relay hostname(s) by country policy: "
+                + ", ".join(blocked)
+            )
         by_name = {row["hostname"]: relay_from_row(row) for row in rows}
         found = set(by_name)
     missing = [name for name in names if name not in found]
@@ -825,9 +1122,10 @@ def relays_by_hostnames(hostnames: Iterable[str], db_path: Path = DB_PATH) -> Li
 def print_scan_line(result: guard.TestResult) -> None:
     speed = "n/a" if result.download_mbps is None else f"{result.download_mbps:.2f} Mbps"
     latency = "n/a" if result.latency_ms is None else f"{result.latency_ms:.1f} ms"
+    loss = "n/a" if getattr(result, "loss_pct", None) is None else f"{result.loss_pct:.0f}%"
     status = "ok" if result.connected and result.download_mbps is not None else "no-speed"
     print(
-        f"{result.observed_at} {result.hostname:18} {status:8} speed={speed:>12} latency={latency:>10} score={result.score:.2f}",
+        f"{result.observed_at} {result.hostname:18} {status:8} speed={speed:>12} latency={latency:>10} loss={loss:>5} score={result.score:.2f}",
         flush=True,
     )
 
@@ -940,6 +1238,9 @@ def emergency_rescue_hostnames(
         placeholders = ",".join("?" for _ in excluded)
         where += f" AND hostname NOT IN ({placeholders})"
         params.extend(sorted(excluded))
+    blocked_sql, blocked_params = blocked_country_sql()
+    where += blocked_sql
+    params.extend(blocked_params)
 
     sql = f"""
         SELECT hostname
@@ -1170,6 +1471,9 @@ def verify_candidate_pool(
     fast_port: int = DEFAULT_FAST_PORT,
     connect_best: bool = False,
     restore: bool = True,
+    keep_current_if_no_better: bool = False,
+    better_min_delta_mbps: float = 0.5,
+    better_min_ratio: float = 1.15,
     db_path: Path = DB_PATH,
 ) -> Dict[str, Any]:
     """True-test fast candidates and keep testing backups until enough pass."""
@@ -1177,8 +1481,43 @@ def verify_candidate_pool(
     ready_target = max(1, min(int(ready_target), pool_size))
     candidate_limit = max(pool_size, int(candidate_limit))
     min_working_mbps = float(min_working_mbps)
+    better_min_delta_mbps = max(0.0, float(better_min_delta_mbps))
+    better_min_ratio = max(1.0, float(better_min_ratio))
 
     sync_relays(update=False, db_path=db_path)
+    current_hostname: Optional[str] = None
+    current_baseline: Optional[Dict[str, Any]] = None
+    if keep_current_if_no_better:
+        try:
+            current_hostname = guard.current_relay_hostname()
+            current_state, _ = guard.mullvad_status(timeout=5)
+        except Exception as exc:
+            current_baseline = {"ok": False, "reason": f"could not read current relay: {exc}"}
+            current_state = "Unknown"
+        if current_hostname and current_state.lower().startswith("connected"):
+            try:
+                sample = full_health_check(dict(config))
+                record_health_check(current_hostname, sample, db_path=db_path)
+                current_baseline = {
+                    "hostname": current_hostname,
+                    "ok": sample.ok,
+                    "reason": sample.reason,
+                    "speed_mbps": sample.speed_mbps,
+                    "latency_ms": sample.latency_ms,
+                    "ran_speed_test": sample.ran_speed_test,
+                }
+                print(
+                    f"Current relay baseline {current_hostname}: "
+                    f"{'ok' if sample.ok else 'bad'} {sample.reason}",
+                    flush=True,
+                )
+            except Exception as exc:
+                current_baseline = {
+                    "hostname": current_hostname,
+                    "ok": False,
+                    "reason": f"current baseline failed: {exc}",
+                }
+
     fast_ranked = False
     candidates = reachable_fast_hostnames(candidate_limit, db_path=db_path)
     if len(candidates) < pool_size:
@@ -1227,8 +1566,49 @@ def verify_candidate_pool(
 
     ready = ready_rows()
     connected: Optional[Dict[str, Any]] = None
+    skipped_connect: Optional[Dict[str, Any]] = None
     if connect_best and ready:
-        connected = connect_relay(str(ready[0]["hostname"]), config)
+        chosen = ready[0]
+        chosen_speed = (
+            optional_float(chosen.get("last_health_mbps"))
+            or optional_float(chosen.get("last_mbps"))
+            or optional_float(chosen.get("best_mbps"))
+        )
+        current_speed = optional_float((current_baseline or {}).get("speed_mbps"))
+        if (
+            keep_current_if_no_better
+            and current_hostname
+            and current_speed is not None
+            and chosen_speed is not None
+        ):
+            decision = speed_beats_baseline(
+                chosen_speed,
+                current_speed,
+                min_working_mbps=min_working_mbps,
+                better_min_delta_mbps=better_min_delta_mbps,
+                better_min_ratio=better_min_ratio,
+            )
+            if not decision["ok"]:
+                skipped_connect = {
+                    "reason": "no_better_candidate",
+                    "kept_hostname": current_hostname,
+                    "candidate_hostname": chosen.get("hostname"),
+                    "current_speed_mbps": decision.get("baseline_speed_mbps"),
+                    "candidate_speed_mbps": decision.get("candidate_speed_mbps"),
+                    "required_speed_mbps": decision.get("required_speed_mbps"),
+                    "better_min_delta_mbps": better_min_delta_mbps,
+                    "better_min_ratio": better_min_ratio,
+                }
+                print(
+                    f"Keeping current relay {current_hostname}: best candidate {chosen.get('hostname')} "
+                    f"{chosen_speed:.2f} Mbps did not beat current baseline {current_speed:.2f} Mbps "
+                    f"(required {decision.get('required_speed_mbps')} Mbps).",
+                    flush=True,
+                )
+            else:
+                connected = connect_relay(str(chosen["hostname"]), config)
+        else:
+            connected = connect_relay(str(chosen["hostname"]), config)
 
     return {
         "pool_size": pool_size,
@@ -1243,6 +1623,8 @@ def verify_candidate_pool(
         "ready_relays": ready,
         "best": best.to_json() if best else None,
         "connected": connected,
+        "current_baseline": current_baseline,
+        "skipped_connect": skipped_connect,
     }
 
 
@@ -1288,6 +1670,9 @@ def idle_refresh_candidates(
     if current_hostname:
         where += " AND hostname != ?"
         params.append(current_hostname.strip().lower())
+    blocked_sql, blocked_params = blocked_country_sql()
+    where += blocked_sql
+    params.extend(blocked_params)
 
     sql = f"""
         SELECT hostname
@@ -1466,6 +1851,294 @@ def functional_outage(sample: guard.HealthSample, config: Dict[str, Any]) -> boo
     return failed_url_count >= failure_floor
 
 
+def maintenance_activity_gate(
+    monitor: TrafficIdleMonitor,
+    user_idle_seconds_required: int,
+) -> tuple[bool, str, Dict[str, Any], Optional[float]]:
+    control_lock = auto_guard_control_lock()
+    if control_lock:
+        reason = str(control_lock.get("reason", "manual maintenance"))
+        return False, f"control lock active: {reason}", {"ok": True, "idle": False}, None
+    traffic_state = monitor.observe()
+    user_ok, user_idle = user_idle_ready(user_idle_seconds_required)
+    idle_ready, idle_reason = maintenance_idle_ready(traffic_state, user_ok, user_idle)
+    if not idle_ready:
+        return False, idle_reason, traffic_state, user_idle
+    if not user_ok:
+        return False, f"user activity detected; HID idle {user_idle:.1f}s", traffic_state, user_idle
+    return True, idle_reason, traffic_state, user_idle
+
+
+def nightly_full_scan_relays(db_path: Path = DB_PATH) -> List[guard.Relay]:
+    sync_relays(update=False, db_path=db_path)
+    blocked_sql, blocked_params = blocked_country_sql()
+    with connect_db(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM relays
+            WHERE status != 'retired'{blocked_sql}
+            ORDER BY
+                CASE WHEN fast_probe_at IS NULL THEN 1 ELSE 0 END,
+                fast_reachable DESC,
+                CASE WHEN fast_score IS NULL THEN -1000000.0 ELSE fast_score END DESC,
+                CASE
+                    WHEN status='working' THEN 0
+                    WHEN status='unknown' THEN 1
+                    WHEN status='no_speed' THEN 2
+                    WHEN status='abandoned' THEN 3
+                    ELSE 4
+                END,
+                CASE WHEN last_test_at IS NULL THEN 0 ELSE 1 END,
+                last_test_at ASC,
+                hostname
+            """,
+            blocked_params,
+        ).fetchall()
+        return [relay_from_row(row) for row in rows]
+
+
+def restore_after_maintenance(
+    previous_relay: Optional[str],
+    previous_connected: bool,
+    config: Dict[str, Any],
+) -> Dict[str, Any]:
+    if previous_relay:
+        if relay_hostname_blocked(previous_relay, config=config):
+            guard.restore_previous(previous_relay, previous_connected, config)
+            return {
+                "action": "blocked_previous_not_restored",
+                "hostname": previous_relay,
+                "previous_connected": previous_connected,
+            }
+        guard.restore_previous(previous_relay, previous_connected, config)
+        return {
+            "action": "restored_previous",
+            "hostname": previous_relay,
+            "previous_connected": previous_connected,
+        }
+    if not previous_connected:
+        quick = bool(config.get("quick_connect", False))
+        timeout = int(config.get("disconnect_wait_timeout_seconds", 5 if quick else 20))
+        if quick:
+            guard.disconnect_fast(timeout=timeout)
+        else:
+            guard.disconnect(timeout=timeout)
+        return {"action": "disconnected", "previous_connected": False}
+    return {"action": "left_current", "reason": "previous relay unknown"}
+
+
+def nightly_full_scan(
+    config: Dict[str, Any],
+    monitor: TrafficIdleMonitor,
+    min_working_mbps: float,
+    abandon_after: int,
+    user_idle_seconds_required: int,
+    max_duration_seconds: int = DEFAULT_NIGHTLY_FULL_SCAN_MAX_SECONDS,
+    better_min_delta_mbps: float = DEFAULT_BETTER_MIN_DELTA_MBPS,
+    better_min_ratio: float = DEFAULT_BETTER_MIN_RATIO,
+    db_path: Path = DB_PATH,
+    enforce_activity_gate: bool = True,
+) -> Dict[str, Any]:
+    """True-test every non-retired relay during a quiet maintenance window.
+
+    When enforce_activity_gate is False (the user-scheduled 04:00 run) the scan
+    ignores user/traffic activity and keeps going until every node is tested or
+    the time limit is hit — "test all nodes by default unless turned off"."""
+    relays = nightly_full_scan_relays(db_path=db_path)
+    if not relays:
+        return {"started": False, "reason": "no nightly scan candidates", "tested": []}
+
+    if enforce_activity_gate:
+        gate_ok, gate_reason, _, _ = maintenance_activity_gate(monitor, user_idle_seconds_required)
+        if not gate_ok:
+            return {"started": False, "reason": gate_reason, "tested": []}
+
+    started_at_mono = time.monotonic()
+    started_at = now()
+    max_duration_seconds = max(0, int(max_duration_seconds))
+    deadline = started_at_mono + max_duration_seconds if max_duration_seconds > 0 else None
+    with connect_db(db_path) as conn:
+        set_meta_value(conn, META_LAST_NIGHTLY_FULL_SCAN_AT, started_at)
+        set_meta_value(
+            conn,
+            META_LAST_NIGHTLY_FULL_SCAN_RESULT,
+            json.dumps({"status": "running", "started_at": started_at, "total": len(relays)}, ensure_ascii=False),
+        )
+        conn.commit()
+
+    previous_relay: Optional[str] = None
+    previous_connected = False
+    current_baseline: Dict[str, Any] = {"ok": False, "reason": "not measured"}
+    try:
+        previous_relay = guard.current_relay_hostname()
+        previous_state, _ = guard.mullvad_status(timeout=5)
+        previous_connected = previous_state.lower().startswith("connected")
+    except Exception as exc:
+        current_baseline = {"ok": False, "reason": f"could not read current relay: {exc}"}
+
+    if previous_relay and previous_connected:
+        try:
+            sample = full_health_check(dict(config))
+            record_health_check(previous_relay, sample, db_path=db_path)
+            current_baseline = {
+                "hostname": previous_relay,
+                "ok": sample.ok,
+                "reason": sample.reason,
+                "speed_mbps": sample.speed_mbps,
+                "latency_ms": sample.latency_ms,
+                "ran_speed_test": sample.ran_speed_test,
+            }
+            print(
+                f"Nightly baseline {previous_relay}: {'ok' if sample.ok else 'bad'} {sample.reason}",
+                flush=True,
+            )
+        except Exception as exc:
+            current_baseline = {
+                "hostname": previous_relay,
+                "ok": False,
+                "reason": f"current baseline failed: {exc}",
+            }
+    monitor.reset_baseline(preserve_idle=True)
+
+    tested: List[str] = []
+    best: Optional[guard.TestResult] = None
+    stopped_reason: Optional[str] = None
+    print(f"Nightly full scan starting total={len(relays)}.", flush=True)
+    for index, relay in enumerate(relays, start=1):
+        if deadline is not None and time.monotonic() >= deadline:
+            stopped_reason = f"time limit reached after {max_duration_seconds}s"
+            print(f"Nightly full scan stopping before {relay.hostname}: {stopped_reason}", flush=True)
+            break
+        if enforce_activity_gate:
+            gate_ok, gate_reason, _, _ = maintenance_activity_gate(monitor, user_idle_seconds_required)
+            if not gate_ok:
+                stopped_reason = gate_reason
+                print(f"Nightly full scan stopping before {relay.hostname}: {gate_reason}", flush=True)
+                break
+        else:
+            gate_reason = "scheduled run (activity gate bypassed)"
+
+        print(f"[{index}/{len(relays)}] Nightly true-testing {relay.hostname}. {gate_reason}", flush=True)
+        result = guard.test_relay(relay, config)
+        tested.append(relay.hostname)
+        record_result(result, min_working_mbps=min_working_mbps, abandon_after=abandon_after, db_path=db_path)
+        print_scan_line(result)
+        if (
+            result.connected
+            and result.download_mbps is not None
+            and float(result.download_mbps) >= float(min_working_mbps)
+            and (best is None or result.score > best.score)
+        ):
+            best = result
+        monitor.reset_baseline(preserve_idle=True)
+        time.sleep(2)
+
+    completed = stopped_reason is None and len(tested) >= len(relays)
+    current_speed = optional_float(current_baseline.get("speed_mbps")) if current_baseline.get("ok") else None
+    best_speed = optional_float(best.download_mbps) if best else None
+    decision = speed_beats_baseline(
+        best_speed,
+        current_speed,
+        min_working_mbps=min_working_mbps,
+        better_min_delta_mbps=better_min_delta_mbps,
+        better_min_ratio=better_min_ratio,
+    )
+    connected: Optional[Dict[str, Any]] = None
+    restored: Optional[Dict[str, Any]] = None
+    decision["best_hostname"] = best.hostname if best else None
+    decision["previous_hostname"] = previous_relay
+    previous_blocked = relay_hostname_blocked(previous_relay, db_path=db_path, config=config)
+    decision["previous_blocked"] = previous_blocked
+    if best and previous_blocked and not decision.get("ok"):
+        decision["ok"] = True
+        decision["reason"] = "previous relay is blocked by country policy; switching to best tested non-blocked relay"
+    try:
+        actual = guard.current_relay_hostname()
+    except Exception:
+        actual = None
+
+    if best and decision.get("ok"):
+        if actual == best.hostname:
+            connected = {
+                "hostname": best.hostname,
+                "requested_hostname": best.hostname,
+                "actual_hostname": actual,
+                "changed": False,
+                "exact_match": True,
+                "accepted_fallback": False,
+                "reason": "best already connected",
+            }
+            decision["action"] = "kept_best_already_connected"
+        else:
+            print(
+                f"Nightly full scan connecting best {best.hostname} "
+                f"{best.download_mbps:.2f} Mbps. Decision: {decision.get('reason')}",
+                flush=True,
+            )
+            try:
+                connected = connect_relay(best.hostname, config)
+                decision["action"] = "connected_best"
+            except Exception as exc:
+                decision["action"] = "connect_best_failed_restore_previous"
+                decision["connect_error"] = str(exc)
+                print(f"Nightly best connect failed: {exc}; restoring previous relay.", flush=True)
+                try:
+                    restored = restore_after_maintenance(previous_relay, previous_connected, config)
+                except Exception as restore_exc:
+                    restored = {"action": "restore_failed", "error": str(restore_exc)}
+                    print(f"Nightly restore after connect failure also failed: {restore_exc}", flush=True)
+    else:
+        print(
+            f"Nightly full scan restoring previous relay. "
+            f"Best={best.hostname if best else 'none'} decision={decision.get('reason')}",
+            flush=True,
+        )
+        try:
+            restored = restore_after_maintenance(previous_relay, previous_connected, config)
+            decision["action"] = restored.get("action")
+        except Exception as exc:
+            restored = {"action": "restore_failed", "error": str(exc)}
+            decision["action"] = "restore_failed"
+            decision["restore_error"] = str(exc)
+            print(f"Nightly restore failed: {exc}", flush=True)
+
+    result_payload = {
+        "started": True,
+        "started_at": started_at,
+        "finished_at": now(),
+        "completed": completed,
+        "stopped_reason": stopped_reason,
+        "total": len(relays),
+        "tested_count": len(tested),
+        "tested": tested,
+        "best": best.to_json() if best else None,
+        "current_baseline": current_baseline,
+        "decision": decision,
+        "connected": connected,
+        "restored": restored,
+    }
+    with connect_db(db_path) as conn:
+        set_meta_value(
+            conn,
+            META_LAST_NIGHTLY_FULL_SCAN_RESULT,
+            json.dumps(
+                {
+                    "status": "completed" if completed else "stopped",
+                    "finished_at": result_payload["finished_at"],
+                    "tested_count": len(tested),
+                    "total": len(relays),
+                    "best_hostname": best.hostname if best else None,
+                    "decision": decision,
+                    "stopped_reason": stopped_reason,
+                },
+                ensure_ascii=False,
+            ),
+        )
+        conn.commit()
+    return result_payload
+
+
 def idle_refresh_batch(
     config: Dict[str, Any],
     monitor: TrafficIdleMonitor,
@@ -1549,6 +2222,11 @@ def auto_guard(
     idle_refresh_user_idle_seconds: int = 1800,
     idle_refresh_activity_threshold_bytes: int = 262144,
     idle_refresh_batch_size: int = 1,
+    nightly_full_scan_enabled: bool = True,
+    nightly_full_scan_cooldown_seconds: int = DEFAULT_NIGHTLY_FULL_SCAN_COOLDOWN_SECONDS,
+    nightly_full_scan_max_seconds: int = DEFAULT_NIGHTLY_FULL_SCAN_MAX_SECONDS,
+    nightly_full_scan_better_min_delta_mbps: float = DEFAULT_BETTER_MIN_DELTA_MBPS,
+    nightly_full_scan_better_min_ratio: float = DEFAULT_BETTER_MIN_RATIO,
     connecting_grace_seconds: int = 45,
     daemon_retry_cooldown: int = 180,
 ) -> int:
@@ -1569,6 +2247,10 @@ def auto_guard(
     idle_refresh_user_idle_seconds = max(0, int(idle_refresh_user_idle_seconds))
     idle_refresh_activity_threshold_bytes = max(0, int(idle_refresh_activity_threshold_bytes))
     idle_refresh_batch_size = max(1, int(idle_refresh_batch_size))
+    nightly_full_scan_cooldown_seconds = max(0, int(nightly_full_scan_cooldown_seconds))
+    nightly_full_scan_max_seconds = max(0, int(nightly_full_scan_max_seconds))
+    nightly_full_scan_better_min_delta_mbps = max(0.0, float(nightly_full_scan_better_min_delta_mbps))
+    nightly_full_scan_better_min_ratio = max(1.0, float(nightly_full_scan_better_min_ratio))
     connecting_grace_seconds = max(0, int(connecting_grace_seconds))
     daemon_retry_cooldown = max(0, int(daemon_retry_cooldown))
 
@@ -1583,7 +2265,24 @@ def auto_guard(
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     AUTO_GUARD_PID_PATH.write_text(str(os.getpid()), encoding="utf-8")
 
+    anti_censorship_mode = guard_config.get("anti_censorship_mode", "")
+    anti_censorship_check_seconds = max(0, int(guard_config.get("anti_censorship_check_seconds", 600) or 0))
+
+    scheduled_full_scan_enabled = bool(guard_config.get("scheduled_full_scan_enabled", True))
+    scheduled_full_scan_hour = max(0, min(23, int(guard_config.get("scheduled_full_scan_hour", 4))))
+    scheduled_full_scan_minute = max(0, min(59, int(guard_config.get("scheduled_full_scan_minute", 0))))
+    scheduled_full_scan_window_minutes = max(1, int(guard_config.get("scheduled_full_scan_window_minutes", 180)))
+    try:
+        changed = guard.ensure_anti_censorship_mode(anti_censorship_mode)
+        if changed:
+            print(f"Anti-censorship: {changed}", flush=True)
+        elif anti_censorship_mode:
+            print(f"Anti-censorship: mode already {anti_censorship_mode}", flush=True)
+    except Exception as exc:
+        print(f"Anti-censorship enforcement failed at startup: {exc}", flush=True)
+
     last_speed_check_at = time.monotonic() - guard_config["speed_check_every_seconds"]
+    last_anti_censorship_check_at = time.monotonic()
     last_fast_rank_at = 0.0
     last_fast_rank_defer_log_at = 0.0
     last_idle_refresh_at = 0.0
@@ -1614,6 +2313,9 @@ def auto_guard(
         f"refresh_pool_cooldown={refresh_pool_cooldown}s "
         f"idle_refresh_enabled={idle_refresh_enabled} idle_refresh_after={idle_refresh_after_seconds}s "
         f"idle_refresh_batch_size={idle_refresh_batch_size} "
+        f"nightly_full_scan_enabled={nightly_full_scan_enabled} "
+        f"nightly_full_scan_cooldown={nightly_full_scan_cooldown_seconds}s "
+        f"nightly_full_scan_max={nightly_full_scan_max_seconds}s "
         f"connecting_grace={connecting_grace_seconds}s daemon_retry_cooldown={daemon_retry_cooldown}s",
         flush=True,
     )
@@ -1628,6 +2330,84 @@ def auto_guard(
                 last_control_lock_log_at = now_mono
             time.sleep(interval)
             continue
+
+        if (
+            anti_censorship_mode
+            and anti_censorship_check_seconds > 0
+            and now_mono - last_anti_censorship_check_at >= anti_censorship_check_seconds
+        ):
+            try:
+                changed = guard.ensure_anti_censorship_mode(anti_censorship_mode)
+                if changed:
+                    print(f"Anti-censorship re-asserted: {changed}", flush=True)
+            except Exception as exc:
+                print(f"Anti-censorship re-assert failed: {exc}", flush=True)
+            last_anti_censorship_check_at = time.monotonic()
+
+        if scheduled_full_scan_enabled:
+            local = time.localtime()
+            today = time.strftime("%Y-%m-%d", local)
+            minutes_now = local.tm_hour * 60 + local.tm_min
+            minutes_start = scheduled_full_scan_hour * 60 + scheduled_full_scan_minute
+            in_window = 0 <= (minutes_now - minutes_start) <= scheduled_full_scan_window_minutes
+            try:
+                with connect_db() as conn:
+                    last_scan_date = meta_value(conn, META_LAST_SCHEDULED_FULL_SCAN_DATE)
+            except Exception:
+                last_scan_date = None
+            if in_window and last_scan_date != today:
+                if scheduled_full_scan_disabled():
+                    print(
+                        f"Scheduled full scan window open for {today} but disabled via float widget/flag; skipping today.",
+                        flush=True,
+                    )
+                    try:
+                        with connect_db() as conn:
+                            set_meta_value(conn, META_LAST_SCHEDULED_FULL_SCAN_DATE, today)
+                    except Exception:
+                        pass
+                else:
+                    print(
+                        f"Scheduled full scan starting for {today} "
+                        f"({scheduled_full_scan_hour:02d}:{scheduled_full_scan_minute:02d}); testing all nodes.",
+                        flush=True,
+                    )
+                    scan_monitor = idle_monitor or TrafficIdleMonitor(
+                        idle_after_seconds=0,
+                        activity_threshold_bytes=idle_refresh_activity_threshold_bytes,
+                    )
+                    try:
+                        data = nightly_full_scan(
+                            guard_config,
+                            scan_monitor,
+                            min_working_mbps=min_working_mbps,
+                            abandon_after=abandon_after,
+                            user_idle_seconds_required=0,
+                            max_duration_seconds=nightly_full_scan_max_seconds,
+                            better_min_delta_mbps=nightly_full_scan_better_min_delta_mbps,
+                            better_min_ratio=nightly_full_scan_better_min_ratio,
+                            enforce_activity_gate=False,
+                        )
+                        best = data.get("best") if isinstance(data.get("best"), dict) else None
+                        decision = data.get("decision") if isinstance(data.get("decision"), dict) else None
+                        print(
+                            f"Scheduled full scan finished: completed={data.get('completed')} "
+                            f"tested={data.get('tested_count')}/{data.get('total')} "
+                            f"best={best.get('hostname') if best else None} "
+                            f"decision={decision.get('action') if decision else None} "
+                            f"stopped={data.get('stopped_reason')}",
+                            flush=True,
+                        )
+                    except Exception as exc:
+                        print(f"Scheduled full scan failed: {exc}", flush=True)
+                    try:
+                        with connect_db() as conn:
+                            set_meta_value(conn, META_LAST_SCHEDULED_FULL_SCAN_DATE, today)
+                    except Exception:
+                        pass
+                    last_speed_check_at = time.monotonic()
+                    last_fast_rank_at = time.monotonic()
+                    continue
 
         fast_rank_due = fast_rank_interval > 0 and now_mono - last_fast_rank_at >= fast_rank_interval
         if fast_rank_due and not idle_monitor:
@@ -1687,6 +2467,37 @@ def auto_guard(
                             print(f"Fast rank failed: {exc}", flush=True)
                         last_fast_rank_at = time.monotonic()
                         idle_monitor.reset_baseline(preserve_idle=True)
+                    nightly_due = (
+                        nightly_full_scan_enabled
+                        and nightly_full_scan_due(nightly_full_scan_cooldown_seconds).get("due")
+                    )
+                    if nightly_due:
+                        data = nightly_full_scan(
+                            guard_config,
+                            idle_monitor,
+                            min_working_mbps=min_working_mbps,
+                            abandon_after=abandon_after,
+                            user_idle_seconds_required=idle_refresh_user_idle_seconds,
+                            max_duration_seconds=nightly_full_scan_max_seconds,
+                            better_min_delta_mbps=nightly_full_scan_better_min_delta_mbps,
+                            better_min_ratio=nightly_full_scan_better_min_ratio,
+                        )
+                        if data.get("started"):
+                            last_idle_refresh_at = time.monotonic()
+                            print(
+                                f"Nightly full scan completed={data.get('completed')} "
+                                f"tested={data.get('tested_count')}/{data.get('total')} "
+                                f"best={(data.get('best') or {}).get('hostname') if isinstance(data.get('best'), dict) else None} "
+                                f"decision={(data.get('decision') or {}).get('action') if isinstance(data.get('decision'), dict) else None} "
+                                f"reason={data.get('stopped_reason')}",
+                                flush=True,
+                            )
+                            idle_monitor.reset_baseline(preserve_idle=True)
+                            time.sleep(interval)
+                            continue
+                        print(f"Nightly full scan deferred: {data.get('reason')}", flush=True)
+                        time.sleep(interval)
+                        continue
                     idle_refresh_due = (
                         idle_refresh_after_seconds <= 0
                         or last_idle_refresh_at <= 0
@@ -1785,7 +2596,8 @@ def auto_guard(
         consecutive_failures += 1
         disconnected_failure = sample.reason.lower().startswith("vpn state")
         functional_failure = functional_outage(sample, guard_config)
-        emergency_recovery = disconnected_failure or functional_failure
+        policy_failure = sample.reason.lower().startswith("blocked relay country")
+        emergency_recovery = disconnected_failure or functional_failure or policy_failure
         active_threshold = 1 if emergency_recovery else failure_threshold
         if consecutive_failures < active_threshold:
             print(
@@ -2060,10 +2872,15 @@ def connect_relay(hostname: str, config: Dict[str, Any]) -> Dict[str, Any]:
     requested = hostname.strip().lower()
     if not requested:
         raise ValueError("Relay hostname is required.")
+    if guard.hostname_is_blocked(requested, config):
+        code = guard.hostname_country_code(requested) or "unknown"
+        raise ValueError(f"Relay {requested} is blocked by country policy ({code}).")
     sync_relays(update=False)
     row = relay_row(requested)
     if not row:
         raise ValueError(f"Unknown relay hostname: {requested}")
+    if country_is_blocked(row["country"], config):
+        raise ValueError(f"Relay {requested} is blocked by country policy ({row['country']}).")
 
     state, status_text = guard.mullvad_status()
     current = guard.current_relay_hostname()
@@ -2098,6 +2915,11 @@ def connect_relay(hostname: str, config: Dict[str, Any]) -> Dict[str, Any]:
         guard.connect(timeout=timeout)
     new_state, new_status = guard.mullvad_status()
     actual = guard.current_relay_hostname()
+    if relay_hostname_blocked(actual, config=config):
+        raise RuntimeError(
+            f"Mullvad connected to blocked relay {actual or 'unknown'} while requesting {requested}. "
+            f"Status: {new_status}"
+        )
     exact_match = actual == requested
     accepted_fallback = False
     fallback_reason: Optional[str] = None
@@ -2135,15 +2957,32 @@ def cli(args: argparse.Namespace, config: Dict[str, Any]) -> int:
         result = sync_relays(update=not args.no_update)
         print(json.dumps(result, ensure_ascii=False) if args.json else result)
         return 0
+    if args.inventory_command == "nightly-toggle":
+        state = getattr(args, "state", "status")
+        if state == "on":
+            set_scheduled_full_scan(True)
+        elif state == "off":
+            set_scheduled_full_scan(False)
+        enabled = not scheduled_full_scan_disabled()
+        with connect_db() as conn:
+            last_date = meta_value(conn, META_LAST_SCHEDULED_FULL_SCAN_DATE)
+        payload = {"enabled": enabled, "last_scan_date": last_date}
+        if getattr(args, "json", False):
+            print(json.dumps(payload, ensure_ascii=False))
+        else:
+            print(f"Daily 04:00 full-node scan: {'ON' if enabled else 'OFF'} (last run: {last_date or 'never'})")
+        return 0
     if args.inventory_command == "top":
         rows = top_relays(limit=args.limit)
         if args.json:
             print(json.dumps(rows, ensure_ascii=False, indent=2))
         else:
             for row in rows:
+                loss = row["last_loss_pct"] if "last_loss_pct" in row.keys() else None
+                loss_txt = "n/a" if loss is None else f"{loss:.0f}%"
                 print(
                     f"{row['hostname']:18} {row['country']}/{row['city']} "
-                    f"last={row['last_mbps']} best={row['best_mbps']} "
+                    f"last={row['last_mbps']} best={row['best_mbps']} loss={loss_txt} "
                     f"tested_at={row['last_test_at']} score={row['score']}"
                 )
         return 0
@@ -2189,6 +3028,9 @@ def cli(args: argparse.Namespace, config: Dict[str, Any]) -> int:
             fast_port=args.fast_port,
             connect_best=args.connect_best,
             restore=not args.no_restore,
+            keep_current_if_no_better=args.keep_current_if_no_better,
+            better_min_delta_mbps=args.better_min_delta_mbps,
+            better_min_ratio=args.better_min_ratio,
         )
         print(json.dumps(data, ensure_ascii=False, indent=2) if args.json else data)
         return 0
@@ -2243,6 +3085,11 @@ def cli(args: argparse.Namespace, config: Dict[str, Any]) -> int:
         config["idle_refresh_user_idle_seconds"] = args.idle_refresh_user_idle_seconds
         config["idle_refresh_activity_threshold_bytes"] = args.idle_refresh_activity_threshold_bytes
         config["idle_refresh_batch_size"] = args.idle_refresh_batch_size
+        config["nightly_full_scan_enabled"] = not args.no_nightly_full_scan
+        config["nightly_full_scan_cooldown_seconds"] = args.nightly_full_scan_cooldown
+        config["nightly_full_scan_max_seconds"] = args.nightly_full_scan_max_seconds
+        config["nightly_full_scan_better_min_delta_mbps"] = args.nightly_full_scan_better_min_delta_mbps
+        config["nightly_full_scan_better_min_ratio"] = args.nightly_full_scan_better_min_ratio
         config["connecting_grace_seconds"] = args.connecting_grace
         config["daemon_retry_cooldown_seconds"] = args.daemon_retry_cooldown
         config["url_emergency_min_failed"] = args.url_emergency_min_failed
@@ -2273,6 +3120,11 @@ def cli(args: argparse.Namespace, config: Dict[str, Any]) -> int:
             idle_refresh_user_idle_seconds=args.idle_refresh_user_idle_seconds,
             idle_refresh_activity_threshold_bytes=args.idle_refresh_activity_threshold_bytes,
             idle_refresh_batch_size=args.idle_refresh_batch_size,
+            nightly_full_scan_enabled=not args.no_nightly_full_scan,
+            nightly_full_scan_cooldown_seconds=args.nightly_full_scan_cooldown,
+            nightly_full_scan_max_seconds=args.nightly_full_scan_max_seconds,
+            nightly_full_scan_better_min_delta_mbps=args.nightly_full_scan_better_min_delta_mbps,
+            nightly_full_scan_better_min_ratio=args.nightly_full_scan_better_min_ratio,
             connecting_grace_seconds=args.connecting_grace,
             daemon_retry_cooldown=args.daemon_retry_cooldown,
         )
